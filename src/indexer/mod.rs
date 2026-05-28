@@ -45,7 +45,7 @@ use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
-    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    cursor::CursorConnector, fabric::FabricConnector, factory::FactoryConnector, gemini::GeminiConnector,
     kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
@@ -15400,6 +15400,7 @@ impl ConnectorKind {
             "kimi" => Some(Self::Kimi),
             "copilot_cli" => Some(Self::CopilotCli),
             "qwen" => Some(Self::Qwen),
+            "fabric" => Some(Self::Fabric),
             _ => None,
         }
     }
@@ -15424,6 +15425,7 @@ impl ConnectorKind {
             Self::Kimi => "kimi",
             Self::CopilotCli => "copilot_cli",
             Self::Qwen => "qwen",
+            Self::Fabric => "fabric",
         }
     }
 
@@ -15449,6 +15451,7 @@ impl ConnectorKind {
             Self::Kimi => Box::new(KimiConnector::new()),
             Self::CopilotCli => Box::new(CopilotCliConnector::new()),
             Self::Qwen => Box::new(QwenConnector::new()),
+            Self::Fabric => Box::new(FabricConnector::new()),
         }
     }
 }
@@ -16037,6 +16040,8 @@ enum ConnectorKind {
     CopilotCli,
     #[serde(rename = "qw", alias = "Qwen")]
     Qwen,
+    #[serde(rename = "fb", alias = "Fabric")]
+    Fabric,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

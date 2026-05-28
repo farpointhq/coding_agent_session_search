@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.4.2"
+version = "0.4.2-fabric.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -73,7 +73,7 @@ memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "831b3b13", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "029253c450702a1714fca4fb34ba290f2cc71d87", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+franken-agent-detection = { version = "*", git = "https://github.com/farpointhq/franken_agent_detection", rev = "26316d689fc7a1316edfa4306c36c2db960f8633", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

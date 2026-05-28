@@ -209,6 +209,7 @@ pub mod copilot;
 pub mod copilot_cli;
 pub mod crush;
 pub mod cursor;
+pub mod fabric;
 pub mod factory;
 pub mod gemini;
 pub mod kimi;
