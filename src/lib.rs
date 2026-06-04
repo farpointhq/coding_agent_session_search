@@ -61200,15 +61200,30 @@ fn run_raw_mirror_command(cmd: RawMirrorCommand, _cli: &Cli) -> CliResult<()> {
             } else {
                 "APPLIED"
             };
-            let gib = stats.bytes_reclaimed as f64 / (1024.0 * 1024.0 * 1024.0);
+            let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let total_reclaimed = stats
+                .bytes_reclaimed
+                .saturating_add(stats.tmp_bytes_reclaimed);
             println!("raw-mirror gc [{mode}] keep={keep}");
             println!("  manifests scanned : {}", stats.manifests_scanned);
             println!("  source files      : {}", stats.source_files);
             println!("  manifests pruned  : {}", stats.manifests_pruned);
             println!("  blobs deleted     : {}", stats.blobs_deleted);
             println!(
-                "  bytes reclaimed   : {} ({gib:.2} GiB)",
-                stats.bytes_reclaimed
+                "  blob bytes        : {} ({:.2} GiB)",
+                stats.bytes_reclaimed,
+                gib(stats.bytes_reclaimed)
+            );
+            println!("  tmp orphans swept : {}", stats.tmp_orphans_swept);
+            println!(
+                "  tmp bytes         : {} ({:.2} GiB)",
+                stats.tmp_bytes_reclaimed,
+                gib(stats.tmp_bytes_reclaimed)
+            );
+            println!(
+                "  total reclaimed   : {} ({:.2} GiB)",
+                total_reclaimed,
+                gib(total_reclaimed)
             );
             Ok(())
         }
