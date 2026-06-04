@@ -53999,6 +53999,24 @@ fn run_index_with_data(
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
+    // Hotfix: also sweep at pass START so reclaim never depends on a single pass
+    // reaching its end-of-pass sweep — a crashed pass's leftovers are reclaimed on
+    // the next pass's start. Runs on the prior pass's at-rest state, before any
+    // capture this pass; best-effort and lock-guarded internally (skips if a run
+    // is active). Keep newest N per source (CASS_RAW_MIRROR_RETENTION, 0 disables).
+    {
+        let keep = raw_mirror_retention_default();
+        if let Err(gc_err) =
+            crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, false)
+        {
+            tracing::warn!(
+                error = %gc_err,
+                data_dir = %data_dir.display(),
+                "start-of-pass raw-mirror sweep failed; continuing"
+            );
+        }
+    }
+
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -61171,6 +61189,12 @@ fn run_raw_mirror_command(cmd: RawMirrorCommand, _cli: &Cli) -> CliResult<()> {
             let keep = keep.unwrap_or_else(raw_mirror_retention_default);
             let stats = crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, !apply)
                 .map_err(|err| CliError::unknown(format!("raw-mirror gc failed: {err:#}")))?;
+            if stats.skipped_active_index {
+                println!(
+                    "raw-mirror gc skipped: an index run is active. Wait for indexing to finish, then retry."
+                );
+                return Ok(());
+            }
             let mode = if stats.dry_run {
                 "DRY-RUN (no files deleted; pass --apply to delete)"
             } else {
