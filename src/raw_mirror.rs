@@ -145,6 +145,11 @@ pub(crate) fn capture_source_file(
             None => {
                 let temp_dir = unique_capture_temp_dir(&root);
                 ensure_private_dir(&temp_dir)?;
+                // Remove the per-capture temp dir (and anything left inside it) on
+                // every exit path, including the `?` error returns below. Replaces
+                // the single success-only cleanup that used to leak the dir — and on
+                // Windows the temp file inside it — whenever a capture failed.
+                let _temp_dir_guard = TempDirGuard::new(&temp_dir);
                 let CopyToTempResult {
                     temp_path,
                     blob_blake3,
@@ -155,7 +160,6 @@ pub(crate) fn capture_source_file(
                 let blob_path = root.join(&blob_relative_path);
                 let already_present =
                     publish_content_addressed_temp(&temp_path, &blob_path, &blob_blake3)?;
-                remove_empty_temp_dir_best_effort(&temp_dir);
                 cache_raw_mirror_blob_record(
                     cache_key.clone(),
                     RawMirrorBlobRecord {
@@ -263,6 +267,10 @@ pub(crate) struct RawMirrorGcStats {
     pub manifests_pruned: usize,
     pub blobs_deleted: usize,
     pub bytes_reclaimed: u64,
+    /// Orphaned `tmp/` capture artifacts reaped (or, in dry-run, that would be).
+    pub tmp_orphans_swept: usize,
+    /// Bytes reclaimed from `tmp/` orphans, tracked separately from blob bytes.
+    pub tmp_bytes_reclaimed: u64,
     pub dry_run: bool,
     /// True when a mutating sweep was skipped because an index run holds the lock.
     pub skipped_active_index: bool,
@@ -312,9 +320,11 @@ fn try_hold_index_run_lock(data_dir: &Path) -> Option<File> {
 /// deleting a blob only when no surviving manifest still references its
 /// `blob_blake3` (blobs are content-addressed and shared across manifests).
 ///
-/// Safety: `keep == 0` disables the sweep. A mutating sweep (`!dry_run`) holds
-/// the index-run lock for its whole duration and is *skipped* (not failed) if a
-/// run is active, so it never races a concurrent capture. Blob paths are always
+/// Safety: `keep == 0` disables manifest/blob retention pruning (but the
+/// `tmp/`-orphan reap still runs — orphans are crash debris, not snapshots). A
+/// mutating sweep (`!dry_run`) holds the index-run lock for its whole duration
+/// and is *skipped* (not failed) if a run is active, so it never races a
+/// concurrent capture. Blob paths are always
 /// re-derived from `blob_blake3` (never trusted from the manifest), only regular
 /// files are unlinked, and a blob whose manifest failed to delete is protected.
 /// Best-effort: per-file failures are logged and skipped.
@@ -327,14 +337,12 @@ pub(crate) fn sweep_raw_mirror_retention(
         dry_run,
         ..Default::default()
     };
-    if keep == 0 {
-        return Ok(stats); // retention disabled
-    }
-
     // A mutating sweep must not run concurrently with a capture. Hold the
     // index-run lock for its duration; if another run owns it, skip (the next
     // idle pass reclaims). Dry-run is read-only and never locks. `_lock` is kept
-    // bound (not `_`) so the flock is held until the function returns.
+    // bound (not `_`) so the flock is held until the function returns. Acquired
+    // before the `keep == 0` check so the tmp-orphan reap below is lock-guarded
+    // even when retention pruning is disabled.
     let _lock = if dry_run {
         None
     } else {
@@ -352,6 +360,21 @@ pub(crate) fn sweep_raw_mirror_retention(
     };
 
     let root = raw_mirror_root(data_dir);
+
+    // Reap orphaned capture temp dirs/files under raw-mirror/v1/tmp. On Windows a
+    // temp whose handle was still open at unlink time leaks here; on any platform
+    // a process that died mid-capture leaves one behind. The mutating sweep holds
+    // the index-run lock (above), so no capture is in flight; dry-run only tallies.
+    // This runs regardless of `keep`: tmp orphans are crash/leak debris, not
+    // retained snapshots, so disabling retention (keep == 0) must still reclaim
+    // them. Also done before the manifests-dir check so a store with only tmp
+    // orphans is still reclaimed.
+    sweep_raw_mirror_tmp_orphans(&root, dry_run, &mut stats);
+
+    if keep == 0 {
+        return Ok(stats); // manifest/blob retention pruning disabled; tmp already reaped
+    }
+
     let manifests_dir = root.join("manifests");
     if !manifests_dir.exists() {
         return Ok(stats);
@@ -508,13 +531,15 @@ pub(crate) fn sweep_raw_mirror_retention(
         }
     }
 
-    if stats.manifests_pruned > 0 || stats.blobs_deleted > 0 {
+    if stats.manifests_pruned > 0 || stats.blobs_deleted > 0 || stats.tmp_orphans_swept > 0 {
         tracing::info!(
             manifests_scanned = stats.manifests_scanned,
             source_files = stats.source_files,
             manifests_pruned = stats.manifests_pruned,
             blobs_deleted = stats.blobs_deleted,
             bytes_reclaimed = stats.bytes_reclaimed,
+            tmp_orphans_swept = stats.tmp_orphans_swept,
+            tmp_bytes_reclaimed = stats.tmp_bytes_reclaimed,
             keep,
             dry_run,
             "completed raw-mirror retention sweep"
@@ -567,6 +592,11 @@ fn copy_source_to_private_temp(
     }
     temp.sync_all()
         .with_context(|| format!("sync raw mirror temp {}", temp_path.display()))?;
+    // Release the write handle before any unlink/hard-link of `temp_path`. On
+    // Windows a file with an open handle cannot be removed (sharing violation),
+    // which previously orphaned the full-size temp copy on the changed-source
+    // path below and forced the caller to publish from a still-open handle.
+    drop(temp);
 
     let final_source_metadata = source
         .metadata()
@@ -704,25 +734,26 @@ fn publish_manifest_bytes_create_new(
 
     let temp_dir = unique_capture_temp_dir(root);
     ensure_private_dir(&temp_dir)?;
+    // Cleans up temp_dir (and the temp file within) on every return path.
+    let _temp_dir_guard = TempDirGuard::new(&temp_dir);
     let temp_path = unique_temp_path(&temp_dir, "manifest");
     let mut temp = private_create_new_file(&temp_path)?;
     temp.write_all(manifest_bytes)
         .with_context(|| format!("write raw mirror manifest temp {}", temp_path.display()))?;
     temp.sync_all()
         .with_context(|| format!("sync raw mirror manifest temp {}", temp_path.display()))?;
+    // Drop the handle before hard-linking so Windows can clean up the temp file
+    // (see copy_source_to_private_temp); the guard above unlinks it regardless.
+    drop(temp);
 
     match fs::hard_link(&temp_path, manifest_path) {
         Ok(()) => {
             sync_file(manifest_path)?;
             sync_parent(manifest_path)?;
-            remove_temp_best_effort(&temp_path);
-            remove_empty_temp_dir_best_effort(&temp_dir);
             Ok(false)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             verify_existing_manifest(manifest_path, blob_blake3)?;
-            remove_temp_best_effort(&temp_path);
-            remove_empty_temp_dir_best_effort(&temp_dir);
             Ok(true)
         }
         Err(err) => Err(anyhow!(
@@ -781,6 +812,9 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
     )?;
     let temp_dir = unique_capture_temp_dir(root);
     ensure_private_dir(&temp_dir)?;
+    // Cleans up temp_dir on every return path (the fsync/permission `?` calls
+    // after the rename could previously leak it).
+    let _temp_dir_guard = TempDirGuard::new(&temp_dir);
     let temp_path = unique_temp_path(&temp_dir, "manifest-update");
     let mut temp = private_create_new_file(&temp_path)?;
     temp.write_all(manifest_bytes).with_context(|| {
@@ -807,7 +841,6 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
     set_private_file_permissions(manifest_path)?;
     sync_file(manifest_path)?;
     sync_parent(manifest_path)?;
-    remove_empty_temp_dir_best_effort(&temp_dir);
     Ok(())
 }
 
@@ -1098,7 +1131,28 @@ fn set_private_create_file_mode(options: &mut OpenOptions) {
     options.mode(0o600);
 }
 
-#[cfg(not(unix))]
+// On Windows, request FILE_SHARE_DELETE (alongside the usual READ/WRITE) so a
+// raw-mirror temp file can be unlinked or renamed even while a handle to it is
+// still open. Without it, `fs::remove_file`/`fs::rename` on an open temp fails
+// with a sharing violation and the temp leaks into `raw-mirror/v1/tmp` — the
+// bulk of the historical Windows bloat. We also drop the handle before the fs
+// op wherever we can; this is the defense-in-depth backstop.
+#[cfg(windows)]
+fn set_private_create_file_mode(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // FILE_SHARE_DELETE is the flag that fixes the bug: it lets remove_file/rename
+    // succeed against this path even while our write handle is open. READ is kept
+    // so antivirus / readers don't trip a sharing violation mid-capture. WRITE is
+    // intentionally NOT shared: the temp is a private, write-exclusive staging copy
+    // whose content is hash-addressed, so a concurrent external writer must never
+    // be able to mutate it before it is hard-linked into the blob store.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn set_private_create_file_mode(_options: &mut OpenOptions) {}
 
 fn sync_file(path: &Path) -> Result<()> {
@@ -1154,14 +1208,123 @@ fn remove_temp_best_effort(path: &Path) {
     }
 }
 
-fn remove_empty_temp_dir_best_effort(path: &Path) {
-    if let Err(err) = fs::remove_dir(path) {
-        tracing::debug!(
-            path = %path.display(),
-            error = %err,
-            "failed to remove raw mirror temp directory"
-        );
+// The per-capture temp dir is now removed by TempDirGuard (below) on every exit
+// path, replacing the old success-only `remove_empty_temp_dir_best_effort`.
+
+/// RAII guard that best-effort removes a per-capture temp dir (and anything left
+/// inside it) on drop, covering every early-return / error path. Without it, a
+/// capture that fails after creating its `tmp/capture.*` dir — e.g. the source
+/// changed mid-copy — leaks the dir, and on Windows the temp file inside it.
+struct TempDirGuard<'a> {
+    dir: &'a Path,
+}
+
+impl<'a> TempDirGuard<'a> {
+    fn new(dir: &'a Path) -> Self {
+        Self { dir }
     }
+}
+
+impl Drop for TempDirGuard<'_> {
+    fn drop(&mut self) {
+        // remove_dir_all, not remove_dir: an error path may have left the temp
+        // file inside. Best-effort — a failure just defers reclaim to the next
+        // `raw-mirror gc` tmp sweep.
+        match fs::remove_dir_all(self.dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::debug!(
+                path = %self.dir.display(),
+                error = %err,
+                "failed to remove raw mirror temp directory"
+            ),
+        }
+    }
+}
+
+/// Best-effort reap of orphaned entries under `raw-mirror/v1/tmp`. Only our own
+/// capture artifacts are touched — `capture.*` dirs and `.blob`/`.manifest` temp
+/// files — never anything else that might be placed there. In normal operation
+/// temp files live *inside* a `capture.*` dir (removed transitively), so only
+/// `capture.*` appears at the top level; the `.blob`/`.manifest` prefixes are a
+/// defensive backstop for a stray top-level temp. A mutating sweep holds the
+/// index-run lock, so nothing here is in flight and every match is an orphan; a
+/// dry run only tallies and deletes nothing.
+fn sweep_raw_mirror_tmp_orphans(root: &Path, dry_run: bool, stats: &mut RawMirrorGcStats) {
+    let tmp_dir = root.join("tmp");
+    let read = match fs::read_dir(&tmp_dir) {
+        Ok(read) => read,
+        Err(_) => return, // no tmp dir yet -> nothing to reap
+    };
+    for entry in read {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let raw_name = entry.file_name();
+        let name = raw_name.to_string_lossy();
+        if !(name.starts_with("capture.")
+            || name.starts_with(".blob.")
+            || name.starts_with(".manifest"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let bytes = tmp_entry_size_best_effort(&path, is_dir);
+        if dry_run {
+            stats.tmp_orphans_swept = stats.tmp_orphans_swept.saturating_add(1);
+            stats.tmp_bytes_reclaimed = stats.tmp_bytes_reclaimed.saturating_add(bytes);
+            continue;
+        }
+        let removed = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {
+                stats.tmp_orphans_swept = stats.tmp_orphans_swept.saturating_add(1);
+                stats.tmp_bytes_reclaimed = stats.tmp_bytes_reclaimed.saturating_add(bytes);
+                tracing::info!(path = %path.display(), freed_bytes = bytes, "reaped orphaned raw-mirror tmp entry");
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                stats.tmp_orphans_swept = stats.tmp_orphans_swept.saturating_add(1);
+                stats.tmp_bytes_reclaimed = stats.tmp_bytes_reclaimed.saturating_add(bytes);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, path = %path.display(), "failed to reap orphaned raw-mirror tmp entry; leaving on disk");
+            }
+        }
+    }
+}
+
+/// Sum the on-disk size of a tmp orphan (a file, or a `capture.*` dir tree).
+/// Best-effort: unreadable entries contribute 0 rather than aborting the sweep.
+fn tmp_entry_size_best_effort(path: &Path, is_dir: bool) -> u64 {
+    if !is_dir {
+        return fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+    let read = match fs::read_dir(path) {
+        Ok(read) => read,
+        Err(_) => return 0,
+    };
+    let mut total = 0u64;
+    for entry in read.flatten() {
+        let child = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                total = total.saturating_add(tmp_entry_size_best_effort(&child, true));
+            }
+            Ok(_) => {
+                if let Ok(md) = fs::symlink_metadata(&child) {
+                    total = total.saturating_add(md.len());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    total
 }
 
 fn redacted_original_path(provider: &str, source_path: &Path) -> String {
@@ -1290,6 +1453,90 @@ mod tests {
         let disabled = sweep_raw_mirror_retention(&data_dir, 0, false).expect("disabled sweep");
         assert_eq!(disabled.manifests_pruned, 0);
         assert_eq!(disabled.blobs_deleted, 0);
+    }
+
+    #[test]
+    fn sweep_reaps_orphaned_tmp_capture_artifacts_and_spares_foreign_files() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        let tmp = root.join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Two orphaned capture dirs, each holding a leftover blob temp, plus a
+        // stray top-level manifest temp — exactly what a crashed or (on Windows)
+        // open-handle-blocked capture leaves behind.
+        let cap_a = tmp.join("capture.123.456.0");
+        fs::create_dir_all(&cap_a).unwrap();
+        fs::write(cap_a.join(".blob.123.456.1.tmp"), vec![0u8; 2048]).unwrap();
+        let cap_b = tmp.join("capture.123.789.2");
+        fs::create_dir_all(&cap_b).unwrap();
+        fs::write(cap_b.join(".blob.123.789.3.tmp"), vec![0u8; 1024]).unwrap();
+        fs::write(tmp.join(".manifest.123.999.4.tmp"), vec![0u8; 16]).unwrap();
+
+        // A file we do not own must never be touched.
+        let foreign = tmp.join("keep-me.txt");
+        fs::write(&foreign, b"not ours").unwrap();
+
+        // Dry run: tallies every orphan, deletes nothing.
+        let dry = sweep_raw_mirror_retention(&data_dir, 1, true).expect("dry sweep");
+        assert!(dry.dry_run);
+        assert_eq!(dry.tmp_orphans_swept, 3, "2 capture dirs + 1 manifest temp");
+        assert_eq!(dry.tmp_bytes_reclaimed, 2048 + 1024 + 16);
+        assert!(cap_a.exists() && cap_b.exists(), "dry run must not delete");
+        assert!(foreign.exists());
+
+        // Apply: orphans gone; the foreign file and tmp dir itself remain.
+        let stats = sweep_raw_mirror_retention(&data_dir, 1, false).expect("apply sweep");
+        assert_eq!(stats.tmp_orphans_swept, 3);
+        assert_eq!(stats.tmp_bytes_reclaimed, 2048 + 1024 + 16);
+        assert!(!cap_a.exists() && !cap_b.exists(), "orphan capture dirs reaped");
+        assert!(!tmp.join(".manifest.123.999.4.tmp").exists());
+        assert!(foreign.exists(), "foreign file preserved");
+
+        // Idempotent: nothing left to reap.
+        let again = sweep_raw_mirror_retention(&data_dir, 1, false).expect("re-sweep");
+        assert_eq!(again.tmp_orphans_swept, 0);
+        assert_eq!(again.tmp_bytes_reclaimed, 0);
+    }
+
+    #[test]
+    fn sweep_reaps_tmp_orphans_even_when_retention_disabled() {
+        // keep == 0 disables manifest/blob pruning, but tmp orphans are crash
+        // debris that must still be reclaimed (regression guard: the keep==0
+        // early-return must not skip the tmp sweep).
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        let tmp = root.join("tmp");
+        let cap = tmp.join("capture.42.42.0");
+        fs::create_dir_all(&cap).unwrap();
+        fs::write(cap.join(".blob.42.42.1.tmp"), vec![0u8; 4096]).unwrap();
+
+        let stats = sweep_raw_mirror_retention(&data_dir, 0, false).expect("keep=0 sweep");
+        assert_eq!(stats.manifests_pruned, 0, "retention pruning disabled");
+        assert_eq!(stats.blobs_deleted, 0, "retention pruning disabled");
+        assert_eq!(stats.tmp_orphans_swept, 1, "tmp reap still runs at keep=0");
+        assert_eq!(stats.tmp_bytes_reclaimed, 4096);
+        assert!(!cap.exists(), "orphan reaped despite keep=0");
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_non_empty_dir_on_drop() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = temp.path().join("capture.guarded");
+        fs::create_dir_all(&dir).unwrap();
+        // A leftover temp file inside: the guard must remove the whole tree, not
+        // just an empty dir (the old remove_dir would have failed here).
+        fs::write(dir.join(".blob.leftover.tmp"), b"orphan").unwrap();
+        {
+            let _guard = TempDirGuard::new(&dir);
+            assert!(dir.exists());
+        }
+        assert!(
+            !dir.exists(),
+            "guard removes the dir and its contents on drop"
+        );
     }
 
     #[test]
