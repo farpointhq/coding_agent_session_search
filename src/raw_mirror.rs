@@ -255,6 +255,274 @@ pub(crate) fn capture_source_file(
     })
 }
 
+/// Stats returned by [`sweep_raw_mirror_retention`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawMirrorGcStats {
+    pub manifests_scanned: usize,
+    pub source_files: usize,
+    pub manifests_pruned: usize,
+    pub blobs_deleted: usize,
+    pub bytes_reclaimed: u64,
+    pub dry_run: bool,
+    /// True when a mutating sweep was skipped because an index run holds the lock.
+    pub skipped_active_index: bool,
+}
+
+/// Minimal, permissive view of a manifest for retention decisions. Mirrors the
+/// `DoctorRawMirrorManifestFile` convention (every field `#[serde(default)]`) so
+/// any subset of fields parses and the GC is decoupled from the full schema.
+///
+/// The blob path is intentionally NOT read here: it is re-derived from
+/// `blob_blake3`, so a corrupt or hostile `blob_relative_path` in the JSON can
+/// never steer a deletion outside the store.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawMirrorManifestSummary {
+    #[serde(default)]
+    manifest_id: String,
+    #[serde(default)]
+    original_path: String,
+    #[serde(default)]
+    captured_at_ms: i64,
+    #[serde(default)]
+    blob_blake3: String,
+    #[serde(default)]
+    blob_size_bytes: u64,
+}
+
+/// Hold the index-run lock for the duration of a mutating sweep so it can never
+/// delete a blob a concurrent capture is publishing. Returns the held lock file
+/// (keep it alive to keep the lock) on success, or `None` if another index/watch
+/// run currently owns it.
+fn try_hold_index_run_lock(data_dir: &Path) -> Option<File> {
+    let lock_path = data_dir.join("index-run.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .ok()?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
+
+/// Garbage-collect superseded raw-mirror snapshots. For each source file
+/// (`original_path`) it keeps the newest `keep` captures and prunes the rest,
+/// deleting a blob only when no surviving manifest still references its
+/// `blob_blake3` (blobs are content-addressed and shared across manifests).
+///
+/// Safety: `keep == 0` disables the sweep. A mutating sweep (`!dry_run`) holds
+/// the index-run lock for its whole duration and is *skipped* (not failed) if a
+/// run is active, so it never races a concurrent capture. Blob paths are always
+/// re-derived from `blob_blake3` (never trusted from the manifest), only regular
+/// files are unlinked, and a blob whose manifest failed to delete is protected.
+/// Best-effort: per-file failures are logged and skipped.
+pub(crate) fn sweep_raw_mirror_retention(
+    data_dir: &Path,
+    keep: usize,
+    dry_run: bool,
+) -> Result<RawMirrorGcStats> {
+    let mut stats = RawMirrorGcStats {
+        dry_run,
+        ..Default::default()
+    };
+    if keep == 0 {
+        return Ok(stats); // retention disabled
+    }
+
+    // A mutating sweep must not run concurrently with a capture. Hold the
+    // index-run lock for its duration; if another run owns it, skip (the next
+    // idle pass reclaims). Dry-run is read-only and never locks. `_lock` is kept
+    // bound (not `_`) so the flock is held until the function returns.
+    let _lock = if dry_run {
+        None
+    } else {
+        match try_hold_index_run_lock(data_dir) {
+            Some(file) => Some(file),
+            None => {
+                stats.skipped_active_index = true;
+                tracing::info!(
+                    data_dir = %data_dir.display(),
+                    "skipping raw-mirror retention sweep: an index run is active"
+                );
+                return Ok(stats);
+            }
+        }
+    };
+
+    let root = raw_mirror_root(data_dir);
+    let manifests_dir = root.join("manifests");
+    if !manifests_dir.exists() {
+        return Ok(stats);
+    }
+
+    // (manifest_file_path, summary)
+    let mut entries: Vec<(PathBuf, RawMirrorManifestSummary)> = Vec::new();
+    for entry in fs::read_dir(&manifests_dir).with_context(|| {
+        format!(
+            "reading raw-mirror manifests dir for retention sweep {}",
+            manifests_dir.display()
+        )
+    })? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::debug!(error = %err, "skipping unreadable raw-mirror manifest entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::debug!(error = %err, path = %path.display(), "skipping unreadable raw-mirror manifest");
+                continue;
+            }
+        };
+        let summary: RawMirrorManifestSummary = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::debug!(error = %err, path = %path.display(), "skipping unparseable raw-mirror manifest");
+                continue;
+            }
+        };
+        // Require a source path and a well-formed blob hash (the hash is what we
+        // group/ref-count/derive-path from). A manifest failing either is skipped.
+        if summary.original_path.is_empty()
+            || raw_mirror_blob_relative_path(&summary.blob_blake3).is_none()
+        {
+            continue;
+        }
+        entries.push((path, summary));
+    }
+    stats.manifests_scanned = entries.len();
+
+    // Group manifest indices by source file (original_path).
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_p, s)) in entries.iter().enumerate() {
+        groups.entry(s.original_path.clone()).or_default().push(i);
+    }
+    stats.source_files = groups.len();
+
+    // Decide kept vs. pruned per group: keep the newest `keep` by capture time,
+    // tie-broken by manifest_id (descending) so equal timestamps are deterministic.
+    let mut kept_idx: Vec<usize> = Vec::new();
+    let mut prune_idx: Vec<usize> = Vec::new();
+    for (_path, mut idxs) in groups {
+        idxs.sort_by(|&a, &b| {
+            entries[b]
+                .1
+                .captured_at_ms
+                .cmp(&entries[a].1.captured_at_ms)
+                .then_with(|| entries[b].1.manifest_id.cmp(&entries[a].1.manifest_id))
+        });
+        for (rank, idx) in idxs.into_iter().enumerate() {
+            if rank < keep {
+                kept_idx.push(idx);
+            } else {
+                prune_idx.push(idx);
+            }
+        }
+    }
+
+    // A blob must survive if ANY manifest that remains on disk references it:
+    // a kept manifest, or a pruned manifest whose delete fails below.
+    let mut protected_blobs: std::collections::HashSet<String> = kept_idx
+        .iter()
+        .map(|&i| entries[i].1.blob_blake3.clone())
+        .collect();
+
+    // Delete pruned manifests; collect candidate blobs (deduped by hash).
+    let mut candidate_blobs: HashMap<String, u64> = HashMap::new();
+    for &i in &prune_idx {
+        let (mpath, s) = &entries[i];
+        let removed = if dry_run {
+            true
+        } else {
+            match fs::remove_file(mpath) {
+                Ok(()) => true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %mpath.display(), "failed to prune superseded raw-mirror manifest; leaving on disk");
+                    // Manifest survives -> its blob must not be deleted.
+                    protected_blobs.insert(s.blob_blake3.clone());
+                    false
+                }
+            }
+        };
+        if removed {
+            stats.manifests_pruned = stats.manifests_pruned.saturating_add(1);
+            candidate_blobs
+                .entry(s.blob_blake3.clone())
+                .or_insert(s.blob_size_bytes);
+        }
+    }
+
+    // Delete candidate blobs that no surviving manifest references. Paths are
+    // re-derived from the hash; only regular files are unlinked.
+    for (hash, size) in &candidate_blobs {
+        if protected_blobs.contains(hash) {
+            continue;
+        }
+        let rel = match raw_mirror_blob_relative_path(hash) {
+            Some(r) => r,
+            None => continue, // defensive: invalid hashes were filtered above
+        };
+        let bpath = root.join(&rel);
+        if dry_run {
+            stats.blobs_deleted = stats.blobs_deleted.saturating_add(1);
+            stats.bytes_reclaimed = stats.bytes_reclaimed.saturating_add(*size);
+            continue;
+        }
+        match fs::symlink_metadata(&bpath) {
+            Ok(md) if md.is_file() => match fs::remove_file(&bpath) {
+                Ok(()) => {
+                    stats.blobs_deleted = stats.blobs_deleted.saturating_add(1);
+                    stats.bytes_reclaimed = stats.bytes_reclaimed.saturating_add(*size);
+                    tracing::info!(blob = %bpath.display(), freed_bytes = *size, "pruned superseded raw-mirror blob");
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Raced away between stat and unlink; still reclaimed.
+                    stats.blobs_deleted = stats.blobs_deleted.saturating_add(1);
+                    stats.bytes_reclaimed = stats.bytes_reclaimed.saturating_add(*size);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, blob = %bpath.display(), "failed to prune superseded raw-mirror blob; leaving on disk");
+                }
+            },
+            Ok(_) => {
+                tracing::warn!(blob = %bpath.display(), "refusing to delete non-regular raw-mirror blob path");
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone: count as reclaimed so dry-run and apply agree.
+                stats.blobs_deleted = stats.blobs_deleted.saturating_add(1);
+                stats.bytes_reclaimed = stats.bytes_reclaimed.saturating_add(*size);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, blob = %bpath.display(), "failed to stat raw-mirror blob before prune; leaving on disk");
+            }
+        }
+    }
+
+    if stats.manifests_pruned > 0 || stats.blobs_deleted > 0 {
+        tracing::info!(
+            manifests_scanned = stats.manifests_scanned,
+            source_files = stats.source_files,
+            manifests_pruned = stats.manifests_pruned,
+            blobs_deleted = stats.blobs_deleted,
+            bytes_reclaimed = stats.bytes_reclaimed,
+            keep,
+            dry_run,
+            "completed raw-mirror retention sweep"
+        );
+    }
+    Ok(stats)
+}
+
 pub(crate) fn merge_manifest_db_links(
     data_dir: &Path,
     manifest_relative_path: &str,
@@ -947,6 +1215,184 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_raw_mirror_retention_keeps_newest_per_source_and_refcounts_blobs() {
+        // Write a minimal manifest + its blob directly so capture timestamps are
+        // deterministic (real captures span 30s index ticks; a unit test cannot).
+        fn write_manifest(
+            root: &Path,
+            orig: &str,
+            captured_at_ms: i64,
+            blob_hex: &str,
+            content: &[u8],
+        ) -> PathBuf {
+            let rel = format!("blobs/blake3/{}/{}.raw", &blob_hex[..2], blob_hex);
+            let blob_path = root.join(&rel);
+            fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+            fs::write(&blob_path, content).unwrap();
+            let manifest_id = format!("{blob_hex}_{captured_at_ms}");
+            let manifest = serde_json::json!({
+                "manifest_id": manifest_id,
+                "original_path": orig,
+                "captured_at_ms": captured_at_ms,
+                "blob_blake3": blob_hex,
+                "blob_relative_path": rel,
+                "blob_size_bytes": content.len() as u64,
+            });
+            fs::write(
+                root.join("manifests").join(format!("m_{manifest_id}.json")),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            blob_path
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        fs::create_dir_all(root.join("manifests")).unwrap();
+
+        // Source A grows across three captures; A's middle blob is content-identical
+        // to source B's (content-addressed dedup -> the same shared blob).
+        let a_v1 = write_manifest(&root, "/src/A.jsonl", 100, &"a".repeat(64), b"A-v1-unique");
+        let a_v2 = write_manifest(&root, "/src/A.jsonl", 200, &"b".repeat(64), b"SHARED-content");
+        let a_v3 = write_manifest(&root, "/src/A.jsonl", 300, &"c".repeat(64), b"A-v3-newest");
+        let _b = write_manifest(&root, "/src/B.jsonl", 150, &"b".repeat(64), b"SHARED-content");
+
+        // Dry run reports the same decisions but mutates nothing.
+        let dry = sweep_raw_mirror_retention(&data_dir, 1, true).expect("dry sweep");
+        assert!(dry.dry_run);
+        assert_eq!(dry.source_files, 2);
+        assert_eq!(dry.manifests_pruned, 2, "A.v1 + A.v2 superseded");
+        assert_eq!(dry.blobs_deleted, 1, "only A.v1's unique blob; shared spared");
+        assert!(a_v1.exists(), "dry run must not delete");
+
+        // Apply: keep newest per source, prune the rest, ref-count blobs.
+        let stats = sweep_raw_mirror_retention(&data_dir, 1, false).expect("apply sweep");
+        assert_eq!(stats.manifests_pruned, 2);
+        assert_eq!(stats.blobs_deleted, 1);
+        assert!(!a_v1.exists(), "A.v1 unique superseded blob deleted");
+        assert!(a_v2.exists(), "shared blob spared (still referenced by B's kept manifest)");
+        assert!(a_v3.exists(), "A's newest blob kept");
+        assert_eq!(
+            fs::read_dir(root.join("manifests")).unwrap().count(),
+            2,
+            "survivors: A.v3 + B",
+        );
+
+        // Idempotent: a second sweep finds nothing to prune.
+        let again = sweep_raw_mirror_retention(&data_dir, 1, false).expect("re-sweep");
+        assert_eq!(again.manifests_pruned, 0);
+        assert_eq!(again.blobs_deleted, 0);
+
+        // keep == 0 disables the sweep entirely.
+        let disabled = sweep_raw_mirror_retention(&data_dir, 0, false).expect("disabled sweep");
+        assert_eq!(disabled.manifests_pruned, 0);
+        assert_eq!(disabled.blobs_deleted, 0);
+    }
+
+    #[test]
+    fn sweep_ignores_hostile_blob_relative_path() {
+        fn write(root: &Path, orig: &str, captured: i64, blob_hex: &str, hostile_rel: &str) {
+            let derived = raw_mirror_blob_relative_path(blob_hex).unwrap();
+            let bp = root.join(&derived);
+            fs::create_dir_all(bp.parent().unwrap()).unwrap();
+            fs::write(&bp, b"x").unwrap();
+            let mid = format!("{blob_hex}_{captured}");
+            let m = serde_json::json!({
+                "manifest_id": mid,
+                "original_path": orig,
+                "captured_at_ms": captured,
+                "blob_blake3": blob_hex,
+                "blob_relative_path": hostile_rel, // must be ignored
+                "blob_size_bytes": 1u64,
+            });
+            fs::write(
+                root.join("manifests").join(format!("m_{mid}.json")),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        fs::create_dir_all(root.join("manifests")).unwrap();
+
+        // A file OUTSIDE the store that a hostile blob_relative_path points at.
+        let sentinel = temp.path().join("SENTINEL");
+        fs::write(&sentinel, b"keep me").unwrap();
+
+        let h_old = "a".repeat(64);
+        let h_new = "b".repeat(64);
+        // Older version carries a path-traversal blob_relative_path; newer is kept.
+        write(&root, "/src/X.jsonl", 100, &h_old, "../../../SENTINEL");
+        write(&root, "/src/X.jsonl", 200, &h_new, "blobs/blake3/zz/ignored.raw");
+
+        let stats = sweep_raw_mirror_retention(&data_dir, 1, false).expect("sweep");
+        assert_eq!(stats.manifests_pruned, 1);
+        assert_eq!(stats.blobs_deleted, 1);
+        assert!(
+            sentinel.exists(),
+            "hostile blob_relative_path must not delete an out-of-store file",
+        );
+        assert!(
+            !root.join(raw_mirror_blob_relative_path(&h_old).unwrap()).exists(),
+            "old blob (hash-derived path) deleted",
+        );
+        assert!(
+            root.join(raw_mirror_blob_relative_path(&h_new).unwrap()).exists(),
+            "newest blob kept",
+        );
+    }
+
+    #[test]
+    fn sweep_same_timestamp_keeps_one_deterministically() {
+        fn write(root: &Path, orig: &str, captured: i64, blob_hex: &str) {
+            let derived = raw_mirror_blob_relative_path(blob_hex).unwrap();
+            let bp = root.join(&derived);
+            fs::create_dir_all(bp.parent().unwrap()).unwrap();
+            fs::write(&bp, b"x").unwrap();
+            let mid = format!("{blob_hex}_{captured}");
+            let m = serde_json::json!({
+                "manifest_id": mid,
+                "original_path": orig,
+                "captured_at_ms": captured,
+                "blob_blake3": blob_hex,
+                "blob_size_bytes": 1u64,
+            });
+            fs::write(
+                root.join("manifests").join(format!("m_{mid}.json")),
+                serde_json::to_vec(&m).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = raw_mirror_root(&data_dir);
+        fs::create_dir_all(root.join("manifests")).unwrap();
+
+        let lo = "1".repeat(64);
+        let hi = "2".repeat(64);
+        // Identical captured_at -> tiebreak by manifest_id desc keeps the higher.
+        write(&root, "/src/Y.jsonl", 500, &lo);
+        write(&root, "/src/Y.jsonl", 500, &hi);
+
+        let stats = sweep_raw_mirror_retention(&data_dir, 1, false).expect("sweep");
+        assert_eq!(stats.manifests_pruned, 1, "exactly one tied version pruned");
+        assert_eq!(stats.blobs_deleted, 1);
+        assert_eq!(fs::read_dir(root.join("manifests")).unwrap().count(), 1);
+        assert!(
+            root.join(raw_mirror_blob_relative_path(&hi).unwrap()).exists(),
+            "higher manifest_id kept",
+        );
+        assert!(
+            !root.join(raw_mirror_blob_relative_path(&lo).unwrap()).exists(),
+            "lower manifest_id pruned",
+        );
+    }
 
     #[test]
     fn capture_source_file_writes_doctor_compatible_manifest_idempotently() {

@@ -1042,6 +1042,10 @@ pub enum Commands {
     /// Manage remote sources (P5.x)
     #[command(subcommand)]
     Sources(SourcesCommand),
+
+    /// Manage the raw-mirror blob store (retention / garbage collection)
+    #[command(subcommand)]
+    RawMirror(RawMirrorCommand),
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
@@ -1097,6 +1101,26 @@ pub enum ImportCommand {
         /// Output directory (default: ChatGPT app support dir on macOS, or ~/.local/share/cass/chatgpt/ on Linux)
         #[arg(long)]
         output_dir: Option<PathBuf>,
+    },
+}
+
+/// Subcommands for the raw-mirror blob store
+#[derive(Subcommand, Debug, Clone)]
+pub enum RawMirrorCommand {
+    /// Prune superseded raw-mirror snapshots, keeping the newest N per source.
+    /// Dry-run by default; pass --apply to actually delete.
+    Gc {
+        /// cass data dir whose raw-mirror/v1 store will be swept
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: PathBuf,
+        /// Keep the most-recent N captures per source file (default: 1).
+        /// 0 disables the sweep.
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Apply deletions. Without this the command only reports what it would
+        /// delete (safe-by-default dry run).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
 }
 
@@ -4303,6 +4327,9 @@ async fn execute_cli(
                 Commands::Sources(subcmd) => {
                     run_sources_command(subcmd, cli)?;
                 }
+                Commands::RawMirror(subcmd) => {
+                    run_raw_mirror_command(subcmd, cli)?;
+                }
                 Commands::Models(subcmd) => {
                     let subcmd = subcmd.clone();
                     let cli_clone = cli.clone();
@@ -7024,6 +7051,7 @@ mod watch_once_resolution_tests {
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
+        Some(Commands::RawMirror(..)) => "raw-mirror".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
@@ -53971,6 +53999,24 @@ fn run_index_with_data(
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
+    // Hotfix: also sweep at pass START so reclaim never depends on a single pass
+    // reaching its end-of-pass sweep — a crashed pass's leftovers are reclaimed on
+    // the next pass's start. Runs on the prior pass's at-rest state, before any
+    // capture this pass; best-effort and lock-guarded internally (skips if a run
+    // is active). Keep newest N per source (CASS_RAW_MIRROR_RETENTION, 0 disables).
+    {
+        let keep = raw_mirror_retention_default();
+        if let Err(gc_err) =
+            crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, false)
+        {
+            tracing::warn!(
+                error = %gc_err,
+                data_dir = %data_dir.display(),
+                "start-of-pass raw-mirror sweep failed; continuing"
+            );
+        }
+    }
+
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -54649,6 +54695,35 @@ fn run_index_with_data(
 
     if show_plain {
         eprintln!("index completed");
+    }
+
+    // Hotfix: once-per-pass raw-mirror retention sweep so superseded snapshots
+    // do not accumulate unboundedly (whole-file blobs are re-captured on every
+    // append and never reclaimed otherwise). Keep newest N per source
+    // (CASS_RAW_MIRROR_RETENTION, default 1; 0 disables). Best-effort: a sweep
+    // failure must not fail an otherwise-successful index pass.
+    if res.is_ok() {
+        let keep = raw_mirror_retention_default();
+        match crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, false) {
+            Ok(stats) if stats.manifests_pruned > 0 || stats.blobs_deleted > 0 => {
+                tracing::info!(
+                    manifests_pruned = stats.manifests_pruned,
+                    blobs_deleted = stats.blobs_deleted,
+                    bytes_reclaimed = stats.bytes_reclaimed,
+                    keep,
+                    data_dir = %data_dir.display(),
+                    "raw-mirror retention sweep reclaimed superseded snapshots"
+                );
+            }
+            Ok(_) => {}
+            Err(gc_err) => {
+                tracing::warn!(
+                    error = %gc_err,
+                    data_dir = %data_dir.display(),
+                    "raw-mirror retention sweep failed; disk may not be reclaimed until next pass"
+                );
+            }
+        }
     }
 
     match res {
@@ -61095,6 +61170,51 @@ fn run_timeline(
 }
 
 /// Handle sources subcommands (P5.x)
+/// Default retention (newest captures kept per source) when `--keep` is absent.
+/// Env-overridable, mirroring `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION`.
+fn raw_mirror_retention_default() -> usize {
+    dotenvy::var("CASS_RAW_MIRROR_RETENTION")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+fn run_raw_mirror_command(cmd: RawMirrorCommand, _cli: &Cli) -> CliResult<()> {
+    match cmd {
+        RawMirrorCommand::Gc {
+            data_dir,
+            keep,
+            apply,
+        } => {
+            let keep = keep.unwrap_or_else(raw_mirror_retention_default);
+            let stats = crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, !apply)
+                .map_err(|err| CliError::unknown(format!("raw-mirror gc failed: {err:#}")))?;
+            if stats.skipped_active_index {
+                println!(
+                    "raw-mirror gc skipped: an index run is active. Wait for indexing to finish, then retry."
+                );
+                return Ok(());
+            }
+            let mode = if stats.dry_run {
+                "DRY-RUN (no files deleted; pass --apply to delete)"
+            } else {
+                "APPLIED"
+            };
+            let gib = stats.bytes_reclaimed as f64 / (1024.0 * 1024.0 * 1024.0);
+            println!("raw-mirror gc [{mode}] keep={keep}");
+            println!("  manifests scanned : {}", stats.manifests_scanned);
+            println!("  source files      : {}", stats.source_files);
+            println!("  manifests pruned  : {}", stats.manifests_pruned);
+            println!("  blobs deleted     : {}", stats.blobs_deleted);
+            println!(
+                "  bytes reclaimed   : {} ({gib:.2} GiB)",
+                stats.bytes_reclaimed
+            );
+            Ok(())
+        }
+    }
+}
+
 fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
         SourcesCommand::List { verbose, json } => {
