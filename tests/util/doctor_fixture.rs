@@ -602,11 +602,18 @@ impl DoctorFixtureFactory {
                     "derived-cleanup-only",
                     "cleanup-fingerprint-required",
                 );
+                // The raw-mirror write path has been removed; do not seed a
+                // raw-mirror store (mirror_raw=false). The index pass below
+                // purges any leftover raw-mirror/ tree, so a seeded mirror would
+                // be listed as a fixture artifact but immediately deleted on
+                // disk, breaking manifest validation. The pruned upstream source
+                // (prune_after_mirror=true) is what this storage-pressure
+                // scenario actually needs.
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
                     true,
-                    true,
+                    false,
                     true,
                 );
                 self.seed_empty_search_index();

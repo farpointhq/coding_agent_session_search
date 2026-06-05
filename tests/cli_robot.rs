@@ -3573,10 +3573,19 @@ fn capabilities_version_matches_crate() {
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
     let version = json["crate_version"].as_str().expect("crate_version");
-    // Should be a valid semver version
+    // crate_version must match Cargo.toml exactly (that is what "matches crate" means).
+    assert_eq!(
+        version,
+        env!("CARGO_PKG_VERSION"),
+        "crate_version should match Cargo.toml version"
+    );
+    // The MAJOR.MINOR.PATCH core (everything before any `-pre.N` / `+build` suffix)
+    // must be semver x.y.z. We split off the pre-release/build metadata first so a
+    // legitimate pre-release tag like `0.4.2-fabric.7` does not trip the dot count.
+    let core = version.split(['-', '+']).next().unwrap_or(version);
     assert!(
-        version.chars().filter(|c| *c == '.').count() == 2,
-        "Version should be semver format (x.y.z)"
+        core.chars().filter(|c| *c == '.').count() == 2,
+        "Version core should be semver format (x.y.z), got: {version}"
     );
 }
 

@@ -2196,6 +2196,12 @@
       "has_json_output": false
     },
     {
+      "name": "raw-mirror",
+      "description": "Purge the deprecated raw-mirror blob store (the write path has been removed)",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
       "name": "models",
       "description": "Manage semantic search models",
       "arguments": [],
