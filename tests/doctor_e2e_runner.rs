@@ -1028,7 +1028,6 @@ fn doctor_e2e_runner_cleanup_low_disk_prunes_only_derived_and_logs() {
         "bookmark_store",
         "canonical_archive_db",
         "operation_receipt",
-        "raw_mirror_blob",
         "support_bundle",
         "user_config",
     ] {
@@ -1109,17 +1108,6 @@ fn doctor_e2e_runner_cleanup_low_disk_prunes_only_derived_and_logs() {
             "cleanup must preserve protected file {protected_path}"
         );
     }
-
-    let raw_mirror_before = filtered_hashes(&before_data, "raw-mirror/v1/");
-    let raw_mirror_after = filtered_hashes(&after_data, "raw-mirror/v1/");
-    assert!(
-        !raw_mirror_before.is_empty(),
-        "low-disk fixture should include raw mirror evidence"
-    );
-    assert_eq!(
-        raw_mirror_before, raw_mirror_after,
-        "cleanup must not rewrite or prune raw mirror evidence"
-    );
 
     let commands = std::fs::read_to_string(result.artifact_dir.join("commands.jsonl")).unwrap();
     assert!(

@@ -1043,7 +1043,7 @@ pub enum Commands {
     #[command(subcommand)]
     Sources(SourcesCommand),
 
-    /// Manage the raw-mirror blob store (retention / garbage collection)
+    /// Purge the deprecated raw-mirror blob store (the write path has been removed)
     #[command(subcommand)]
     RawMirror(RawMirrorCommand),
     /// Manage semantic search models
@@ -1107,18 +1107,17 @@ pub enum ImportCommand {
 /// Subcommands for the raw-mirror blob store
 #[derive(Subcommand, Debug, Clone)]
 pub enum RawMirrorCommand {
-    /// Prune superseded raw-mirror snapshots, keeping the newest N per source.
-    /// Dry-run by default; pass --apply to actually delete.
-    Gc {
-        /// cass data dir whose raw-mirror/v1 store will be swept
+    /// Purge the deprecated raw-mirror store entirely. The raw-mirror write path
+    /// has been removed; the store is now pure leftover disk and the index never
+    /// reads it. Dry-run by default; pass --apply to actually delete.
+    Purge {
+        /// cass data dir whose raw-mirror/v1 store will be purged.
+        /// Defaults to the standard data dir (CASS_DATA_DIR / platform default),
+        /// matching how `index` and the other data-dir commands resolve it.
         #[arg(long, value_hint = ValueHint::DirPath)]
-        data_dir: PathBuf,
-        /// Keep the most-recent N captures per source file (default: 1).
-        /// 0 disables the sweep.
-        #[arg(long)]
-        keep: Option<usize>,
-        /// Apply deletions. Without this the command only reports what it would
-        /// delete (safe-by-default dry run).
+        data_dir: Option<PathBuf>,
+        /// Apply the deletion. Without this the command only reports what it
+        /// would reclaim (safe-by-default dry run).
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
@@ -16667,6 +16666,49 @@ struct DoctorRawMirrorBackfillCandidate {
     message_count: usize,
 }
 
+/// Canonical archive coverage baseline derived directly from the cass archive
+/// database (conversations/messages), independent of the removed raw-mirror
+/// write path.
+///
+/// The raw-mirror capture/backfill store no longer exists, so the doctor
+/// coverage gate can no longer learn archive coverage from raw-mirror backfill
+/// receipts. These counts feed the data-loss-protection coverage gate
+/// (refusing rebuilds that would shrink conversation/message coverage) and the
+/// sole-copy risk surface straight from the DB instead.
+#[derive(Debug, Clone, Default)]
+struct DoctorCoverageDbBaseline {
+    db_available: bool,
+    archive_conversation_count: usize,
+    archived_message_count: usize,
+    visible_current_source_count: usize,
+    visible_current_source_bytes: u64,
+    current_source_newer_than_archive_count: usize,
+    /// DB rows that are sole-copy candidates: the upstream source is no longer
+    /// visible and (with raw-mirror capture removed) no mirror copy exists.
+    db_without_raw_mirror_count: usize,
+    db_projection_only_count: usize,
+    missing_current_source_count: usize,
+    earliest_started_at_ms: Option<i64>,
+    latest_started_at_ms: Option<i64>,
+    missing_sources: Vec<DoctorMissingSourceDetail>,
+}
+
+/// Per-conversation detail for an archived row whose upstream provider file is
+/// no longer visible. Drives sole-copy warnings without reading raw session
+/// text and without leaking exact source paths.
+#[derive(Debug, Clone, Default)]
+struct DoctorMissingSourceDetail {
+    conversation_id: Option<i64>,
+    provider: String,
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+    redacted_source_path: Option<String>,
+    source_path_blake3: Option<String>,
+    message_count: usize,
+    db_projection_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorRawMirrorBackfillReport {
     schema_version: u32,
@@ -19963,6 +20005,30 @@ fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
 }
 
 fn query_doctor_raw_mirror_backfill_candidates(
+    _conn: &frankensqlite::Connection,
+) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, frankensqlite::FrankenError> {
+    // The raw-mirror write path has been removed: capture no longer runs, so no
+    // conversation can ever be backfilled into the mirror (nothing to capture,
+    // nothing to link). Always return zero candidates so the raw_mirror_backfill
+    // doctor check resolves to "clean"/pass instead of advertising a "planned"
+    // backfill ("N live source files can be captured with --fix") that can no
+    // longer happen. The previous implementation scanned every conversation row,
+    // which made doctor warn on every healthy lexical store once capture was gone.
+    Ok(Vec::new())
+}
+
+/// Scan the archive DB for per-conversation coverage rows (provider, source
+/// identity, source_path, started_at, message_count).
+///
+/// This drives the doctor coverage gate's canonical archive baseline directly
+/// from the DB now that raw-mirror capture/backfill is gone. Unlike the removed
+/// backfill candidate scan, these rows only feed the coverage ledger and
+/// sole-copy (missing-upstream) reporting; they never advertise a "planned"
+/// capture/backfill action, so a healthy store stays quiet.
+///
+/// Message counts come from a `LEFT JOIN ... GROUP BY` (not a correlated
+/// subquery) so the row scan stays portable across the embedded SQL engine.
+fn query_doctor_coverage_archive_rows(
     conn: &frankensqlite::Connection,
 ) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, frankensqlite::FrankenError> {
     use frankensqlite::compat::ConnectionExt as _;
@@ -19981,8 +20047,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
     let can_join_sources = conversation_columns.contains("source_id")
         && source_columns.contains("id")
         && source_columns.contains("kind");
-    let can_count_messages =
-        message_columns.contains("conversation_id") && message_columns.contains("id");
+    let can_count_messages = message_columns.contains("conversation_id");
 
     let provider_expr = if can_join_agents {
         "COALESCE(a.slug, 'unknown')"
@@ -20010,13 +20075,6 @@ fn query_doctor_raw_mirror_backfill_candidates(
     } else {
         "NULL"
     };
-    let message_count_expr = if can_count_messages {
-        "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)"
-    } else if conversation_columns.contains("message_count") {
-        "COALESCE(c.message_count, 0)"
-    } else {
-        "0"
-    };
     let agent_join = if can_join_agents {
         " LEFT JOIN agents a ON c.agent_id = a.id"
     } else {
@@ -20027,10 +20085,32 @@ fn query_doctor_raw_mirror_backfill_candidates(
     } else {
         ""
     };
+
+    // Count messages via an aggregated LEFT JOIN rather than a correlated
+    // subquery (which the embedded SQL engine does not evaluate per row here).
+    let (message_count_expr, message_join, group_by_clause) = if can_count_messages {
+        (
+            "COUNT(m.conversation_id)".to_string(),
+            " LEFT JOIN messages m ON m.conversation_id = c.id".to_string(),
+            format!(
+                " GROUP BY c.id, {provider_expr}, {source_path_expr}, {source_id_expr}, \
+                  {origin_host_expr}, {origin_kind_expr}, {started_at_expr}"
+            ),
+        )
+    } else if conversation_columns.contains("message_count") {
+        (
+            "COALESCE(c.message_count, 0)".to_string(),
+            String::new(),
+            String::new(),
+        )
+    } else {
+        ("0".to_string(), String::new(), String::new())
+    };
+
     let sql = format!(
         "SELECT c.id, {provider_expr}, {source_path_expr}, {source_id_expr}, \
          {origin_host_expr}, {origin_kind_expr}, {started_at_expr}, {message_count_expr} \
-         FROM conversations c{agent_join}{source_join} \
+         FROM conversations c{agent_join}{source_join}{message_join}{group_by_clause} \
          ORDER BY c.id"
     );
 
@@ -20195,18 +20275,6 @@ fn doctor_raw_mirror_existing_evidence_maps(
     (by_conversation_id, by_source_key)
 }
 
-fn doctor_raw_mirror_backfill_db_link(
-    candidate: &DoctorRawMirrorBackfillCandidate,
-    source_path: Option<&str>,
-) -> crate::raw_mirror::RawMirrorDbLink {
-    crate::raw_mirror::RawMirrorDbLink {
-        conversation_id: Some(candidate.conversation_id),
-        message_count: Some(candidate.message_count),
-        source_path: source_path.map(ToOwned::to_owned),
-        started_at_ms: candidate.started_at_ms,
-    }
-}
-
 fn doctor_raw_mirror_backfill_receipt_base(
     data_dir: &Path,
     candidate: &DoctorRawMirrorBackfillCandidate,
@@ -20369,27 +20437,13 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
             };
         }
         if apply {
-            let link = doctor_raw_mirror_backfill_db_link(candidate, Some(&source_path));
-            match crate::raw_mirror::merge_manifest_db_links(
-                data_dir,
-                &evidence.manifest_relative_path,
-                &[link],
-            ) {
-                Ok(()) => {
-                    receipt.raw_mirror_db_linked = true;
-                    receipt.action = if changed {
-                        "linked_existing_raw_manifest_live_source_changed".to_string()
-                    } else {
-                        "linked_existing_raw_manifest".to_string()
-                    };
-                }
-                Err(err) => {
-                    receipt.action = "existing_raw_manifest_link_failed".to_string();
-                    receipt.warnings.push(format!(
-                        "failed to link existing raw mirror manifest to archive row: {err}"
-                    ));
-                }
-            }
+            // The raw-mirror write path (including manifest DB-link enrichment) has
+            // been removed; doctor backfill no longer mutates the deprecated mirror
+            // store. The DB-projection evidence above is preserved as-is.
+            receipt.action = "raw_mirror_capture_removed".to_string();
+            receipt.warnings.push(
+                "raw mirror capture has been removed; existing manifest DB-link enrichment is no longer performed".to_string(),
+            );
         }
         return receipt;
     }
@@ -20418,37 +20472,14 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         return receipt;
     }
 
-    let link = doctor_raw_mirror_backfill_db_link(candidate, Some(&source_path));
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider: &provider,
-        source_id: &source_id,
-        origin_kind: &origin_kind,
-        origin_host: origin_host.as_deref(),
-        source_path: path,
-        db_links: &[link],
-    }) {
-        Ok(record) => {
-            receipt.action = if record.already_present {
-                "captured_live_source_already_present".to_string()
-            } else {
-                "captured_live_source".to_string()
-            };
-            receipt.raw_source_captured = true;
-            receipt.raw_mirror_db_linked = true;
-            receipt.captured_at_ms = Some(record.captured_at_ms);
-            receipt.raw_mirror_manifest_id = Some(record.manifest_id);
-            receipt.raw_mirror_manifest_relative_path = Some(record.manifest_relative_path);
-            receipt.raw_mirror_blob_blake3 = Some(record.blob_blake3);
-            receipt.raw_mirror_blob_size_bytes = Some(record.blob_size_bytes);
-        }
-        Err(err) => {
-            receipt.action = "capture_live_source_failed".to_string();
-            receipt.warnings.push(format!(
-                "failed to capture live source into raw mirror; provider file was not modified: {err}"
-            ));
-        }
-    }
+    // The raw-mirror write path has been removed: doctor backfill no longer
+    // captures live source bytes into the deprecated mirror store (the whole-file
+    // re-copy caused unbounded disk growth). The DB-projection reporting above is
+    // preserved; we simply stop short of writing the mirror.
+    receipt.action = "raw_mirror_capture_removed".to_string();
+    receipt.warnings.push(
+        "raw mirror capture has been removed; live source bytes are no longer mirrored during doctor backfill".to_string(),
+    );
 
     receipt
 }
@@ -20712,53 +20743,179 @@ fn doctor_coverage_confidence_tier(
     }
 }
 
+/// Build the canonical archive coverage baseline straight from the DB.
+///
+/// Replaces the old raw-mirror-backfill-receipt path: capture/backfill no
+/// longer runs, so the coverage gate reads conversation/message coverage and
+/// sole-copy (missing-upstream) risk directly from the archive database.
+fn collect_doctor_coverage_db_baseline(
+    data_dir: &Path,
+    db_path: &Path,
+) -> DoctorCoverageDbBaseline {
+    let mut baseline = DoctorCoverageDbBaseline::default();
+    if !db_path.exists() {
+        return baseline;
+    }
+    let query_result = open_franken_cli_read_db(
+        db_path.to_path_buf(),
+        "doctor coverage baseline",
+        Duration::from_secs(1),
+    )
+    .and_then(|conn| {
+        let rows = query_doctor_coverage_archive_rows(&conn).map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to query doctor coverage baseline: {e}"),
+            hint: None,
+            retryable: false,
+        });
+        let close_result = close_franken_cli_read_db(conn, db_path, "doctor coverage baseline");
+        match (rows, close_result) {
+            (Ok(rows), Ok(())) => Ok(rows),
+            (Err(err), _) | (_, Err(err)) => Err(err),
+        }
+    });
+
+    let candidates = match query_result {
+        Ok(candidates) => {
+            baseline.db_available = true;
+            candidates
+        }
+        // On a DB read error we leave the baseline empty; the coverage gate then
+        // treats coverage as unknown rather than fabricating counts.
+        Err(_) => return baseline,
+    };
+
+    let mut visible_source_path_hashes = HashSet::new();
+    for candidate in &candidates {
+        baseline.archive_conversation_count += 1;
+        baseline.archived_message_count += candidate.message_count;
+        if let Some(started_at) = candidate.started_at_ms {
+            baseline.earliest_started_at_ms = Some(
+                baseline
+                    .earliest_started_at_ms
+                    .map_or(started_at, |existing| existing.min(started_at)),
+            );
+            baseline.latest_started_at_ms = Some(
+                baseline
+                    .latest_started_at_ms
+                    .map_or(started_at, |existing| existing.max(started_at)),
+            );
+        }
+
+        let provider = doctor_normalized_provider_slug(&candidate.provider);
+        let origin_host = normalized_provenance_origin_host(candidate.origin_host.as_deref());
+        let source_id = normalized_provenance_source_id(
+            candidate.source_id.as_str(),
+            candidate.origin_kind.as_deref(),
+            origin_host.as_deref(),
+        );
+        let origin_kind = normalized_provenance_origin_kind(
+            source_id.as_str(),
+            candidate.origin_kind.as_deref(),
+        );
+        let is_remote = source_id != crate::sources::provenance::LOCAL_SOURCE_ID
+            || origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
+            || origin_host.is_some();
+        let source_path = doctor_normalized_source_path(candidate.source_path.as_deref());
+        let unknown_mapping = provider == "unknown" || source_path.is_none();
+
+        let redacted_source_path = source_path
+            .as_deref()
+            .map(|path| doctor_redacted_path(path, data_dir));
+        let source_path_blake3 = source_path
+            .as_deref()
+            .map(doctor_raw_mirror_backfill_source_path_blake3);
+
+        // Classify the row's upstream visibility. Remote or unmapped rows are
+        // DB-projection-only (we never read remote/relative paths from the
+        // local filesystem). Local rows are checked against disk.
+        let mut missing = false;
+        let mut db_projection_only = false;
+        if is_remote || unknown_mapping {
+            db_projection_only = true;
+        } else if let Some(path) = source_path.as_deref() {
+            let stat = doctor_raw_mirror_backfill_source_stat(Path::new(path));
+            if !stat.exists {
+                missing = true;
+                db_projection_only = true;
+            } else if stat.file_type == "file" {
+                if visible_source_path_hashes.insert(source_path_blake3.clone()) {
+                    baseline.visible_current_source_count += 1;
+                    baseline.visible_current_source_bytes = baseline
+                        .visible_current_source_bytes
+                        .saturating_add(stat.size_bytes.unwrap_or_default());
+                }
+                if let (Some(modified_at_ms), Some(started_at_ms)) =
+                    (stat.modified_at_ms, candidate.started_at_ms)
+                    && modified_at_ms > started_at_ms
+                {
+                    baseline.current_source_newer_than_archive_count += 1;
+                }
+            }
+        }
+
+        if db_projection_only {
+            baseline.db_projection_only_count += 1;
+        }
+        if missing {
+            baseline.missing_current_source_count += 1;
+            // With raw-mirror capture removed, a missing upstream source means
+            // the archive DB row is the only remaining copy: it is a DB row
+            // without any raw-mirror backstop, i.e. a sole-copy candidate.
+            baseline.db_without_raw_mirror_count += 1;
+            baseline.missing_sources.push(DoctorMissingSourceDetail {
+                conversation_id: Some(candidate.conversation_id),
+                provider,
+                source_id,
+                origin_kind,
+                origin_host,
+                redacted_source_path,
+                source_path_blake3,
+                message_count: candidate.message_count,
+                db_projection_only: true,
+            });
+        }
+    }
+
+    baseline
+}
+
 fn build_doctor_sole_copy_warnings(
-    backfill: &DoctorRawMirrorBackfillReport,
+    baseline: &DoctorCoverageDbBaseline,
 ) -> Vec<DoctorSoleCopyWarning> {
-    backfill
-        .receipts
+    baseline
+        .missing_sources
         .iter()
-        .filter(|receipt| receipt.source_missing)
-        .map(|receipt| {
-            let confidence_tier = if receipt.raw_source_captured {
-                "verified_raw_mirror".to_string()
-            } else if receipt.db_projection_only {
-                "db_projection_only".to_string()
-            } else {
-                "archive_db".to_string()
-            };
-            let reason = if receipt.raw_source_captured {
-                "upstream provider file is missing, but cass has verified raw mirror evidence linked to the archive row"
-                    .to_string()
-            } else {
-                "upstream provider file is missing and no verified raw mirror evidence is linked; cass archive DB rows may be the only remaining copy"
-                    .to_string()
-            };
-            let recommended_action = if receipt.raw_source_captured {
-                "Keep the cass data directory and raw-mirror backup; do not rebuild from live sources if coverage would shrink."
-                    .to_string()
-            } else {
+        .map(|detail| {
+            // Raw-mirror capture has been removed, so a missing-upstream row can
+            // never have verified raw mirror evidence: it is always a
+            // db_projection_only sole copy.
+            let confidence_tier = "db_projection_only".to_string();
+            let reason =
+                "upstream provider file is missing and no raw mirror evidence exists; cass archive DB rows may be the only remaining copy"
+                    .to_string();
+            let recommended_action =
                 "Back up the cass data directory before repair, and avoid source-session rebuilds that would drop this archive row."
-                    .to_string()
-            };
+                    .to_string();
             DoctorSoleCopyWarning {
                 stable_warning_id: doctor_canonical_blake3(
                     "doctor-sole-copy-warning-v1",
                     serde_json::json!({
-                        "record": receipt.stable_record_id,
-                        "source_path_blake3": receipt.source_path_blake3,
+                        "conversation_id": detail.conversation_id,
+                        "source_path_blake3": detail.source_path_blake3,
                     }),
                 ),
-                conversation_id: receipt.conversation_id,
-                provider: receipt.provider.clone(),
-                source_id: receipt.source_id.clone(),
-                origin_kind: receipt.origin_kind.clone(),
-                origin_host: receipt.origin_host.clone(),
-                redacted_source_path: receipt.redacted_source_path.clone(),
-                source_path_blake3: receipt.source_path_blake3.clone(),
-                message_count: receipt.message_count,
-                raw_source_captured: receipt.raw_source_captured,
-                db_projection_only: receipt.db_projection_only,
+                conversation_id: detail.conversation_id,
+                provider: detail.provider.clone(),
+                source_id: detail.source_id.clone(),
+                origin_kind: detail.origin_kind.clone(),
+                origin_host: detail.origin_host.clone(),
+                redacted_source_path: detail.redacted_source_path.clone(),
+                source_path_blake3: detail.source_path_blake3.clone(),
+                message_count: detail.message_count,
+                raw_source_captured: false,
+                db_projection_only: detail.db_projection_only,
                 confidence_tier,
                 reason,
                 recommended_action,
@@ -20770,9 +20927,14 @@ fn build_doctor_sole_copy_warnings(
 fn build_doctor_coverage_summary(
     source_inventory: &DoctorSourceInventoryReport,
     raw_mirror: &DoctorRawMirrorReport,
-    backfill: &DoctorRawMirrorBackfillReport,
+    baseline: &DoctorCoverageDbBaseline,
     sole_copy_warnings: &[DoctorSoleCopyWarning],
 ) -> DoctorCoverageSummary {
+    // The raw-mirror *write* path has been removed, but the read side still
+    // reports any pre-existing on-disk mirror store. Mirror DB-link counts
+    // therefore come from whatever verified manifests still exist on disk
+    // (zero on a freshly built archive), while the canonical conversation /
+    // message / missing-source baselines come straight from the archive DB.
     let raw_mirror_db_link_count = raw_mirror
         .manifests
         .iter()
@@ -20785,53 +20947,18 @@ fn build_doctor_coverage_summary(
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
         .filter(|manifest| manifest.db_link_count == 0)
         .count();
-    let archived_message_count = backfill
-        .receipts
-        .iter()
-        .map(|receipt| receipt.message_count)
-        .sum::<usize>();
-    let mut visible_source_path_hashes = HashSet::new();
-    let mut visible_current_source_bytes = 0u64;
-    let mut current_source_newer_than_archive_count = 0usize;
-    for receipt in &backfill.receipts {
-        let Some(snapshot) = receipt.source_stat_snapshot.as_ref() else {
-            continue;
-        };
-        if snapshot.exists && snapshot.file_type == "file" {
-            if let Some(path_hash) = receipt.source_path_blake3.as_ref()
-                && visible_source_path_hashes.insert(path_hash.clone())
-            {
-                visible_current_source_bytes = visible_current_source_bytes
-                    .saturating_add(snapshot.size_bytes.unwrap_or_default());
-            }
-            if let (Some(modified_at_ms), Some(started_at_ms)) =
-                (snapshot.modified_at_ms, receipt.started_at_ms)
-                && modified_at_ms > started_at_ms
-            {
-                current_source_newer_than_archive_count += 1;
-            }
-        }
-    }
-    let db_without_raw_mirror_count = backfill
-        .receipts
-        .iter()
-        .filter(|receipt| !receipt.raw_mirror_db_linked)
-        .count();
-    let earliest_started_at_ms = backfill
-        .receipts
-        .iter()
-        .filter_map(|receipt| receipt.started_at_ms)
-        .min();
-    let latest_started_at_ms = backfill
-        .receipts
-        .iter()
-        .filter_map(|receipt| receipt.started_at_ms)
-        .max();
+    let archived_message_count = baseline.archived_message_count;
+    let visible_current_source_bytes = baseline.visible_current_source_bytes;
+    let current_source_newer_than_archive_count =
+        baseline.current_source_newer_than_archive_count;
+    let db_without_raw_mirror_count = baseline.db_without_raw_mirror_count;
+    let earliest_started_at_ms = baseline.earliest_started_at_ms;
+    let latest_started_at_ms = baseline.latest_started_at_ms;
     let confidence_tier = doctor_coverage_confidence_tier(
         source_inventory.total_indexed_conversations,
-        backfill.db_projection_only_count,
+        baseline.db_projection_only_count,
         db_without_raw_mirror_count,
-        backfill.source_missing_count,
+        baseline.missing_current_source_count,
         raw_mirror_db_link_count,
         mirror_without_db_link_count,
         current_source_newer_than_archive_count,
@@ -20844,10 +20971,8 @@ fn build_doctor_coverage_summary(
     let recommended_action = if !sole_copy_warnings.is_empty() {
         "Back up the cass data directory and avoid source-session rebuilds that reduce archive coverage.".to_string()
     } else if db_without_raw_mirror_count > 0 {
-        "Run 'cass doctor --fix --json' to add raw-mirror coverage for eligible live source files."
+        "Back up the cass data directory before repair; some archived conversations no longer have a visible upstream source and the archive DB may be their only copy."
             .to_string()
-    } else if mirror_without_db_link_count > 0 {
-        "Inspect unlinked raw mirror manifests before rebuild or cleanup; preserve them unless they are explicitly proven unrelated to the archive.".to_string()
     } else {
         "Coverage ledger has no immediate action for archive preservation.".to_string()
     };
@@ -20859,14 +20984,14 @@ fn build_doctor_coverage_summary(
         archived_message_count,
         provider_count: source_inventory.provider_counts.len(),
         source_identity_count: source_inventory.sources.len(),
-        visible_current_source_count: visible_source_path_hashes.len(),
+        visible_current_source_count: baseline.visible_current_source_count,
         visible_current_source_bytes,
-        raw_mirror_manifest_count: raw_mirror.summary.manifest_count,
+        raw_mirror_manifest_count: 0,
         raw_mirror_db_link_count,
         db_without_raw_mirror_count,
-        db_projection_only_count: backfill.db_projection_only_count,
+        db_projection_only_count: baseline.db_projection_only_count,
         mirror_without_db_link_count,
-        missing_current_source_count: backfill.source_missing_count,
+        missing_current_source_count: baseline.missing_current_source_count,
         sole_copy_candidate_count: sole_copy_warnings.len(),
         current_source_newer_than_archive_count,
         remote_source_count: source_inventory.remote_source_count,
@@ -20876,9 +21001,9 @@ fn build_doctor_coverage_summary(
         coverage_reducing_live_source_rebuild_refused,
         recommended_action,
         notes: vec![
-            "coverage_summary compares the archive DB, verified raw mirror manifests, and currently visible upstream source files without reading raw session text into robot output.".to_string(),
-            "db_without_raw_mirror_count is a repair-risk signal: rebuilding only from current source files could shrink the archive.".to_string(),
-            "sole_copy_candidate_count means cass-controlled storage may be the only remaining copy for those upstream-pruned conversations.".to_string(),
+            "coverage_summary compares the archive DB conversation/message counts against currently visible upstream source files without reading raw session text into robot output.".to_string(),
+            "db_without_raw_mirror_count counts archived conversations whose upstream source is no longer visible and which have no mirror copy; rebuilding only from current source files could shrink the archive.".to_string(),
+            "sole_copy_candidate_count means the cass archive database may be the only remaining copy for those upstream-pruned conversations.".to_string(),
         ],
     }
 }
@@ -21098,12 +21223,12 @@ fn collect_doctor_coverage_risk_summary(
     }
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
     let raw_mirror = collect_doctor_raw_mirror_report(data_dir);
-    let backfill = collect_doctor_raw_mirror_backfill_report(data_dir, db_path, &raw_mirror, false);
-    let sole_copy_warnings = build_doctor_sole_copy_warnings(&backfill);
+    let baseline = collect_doctor_coverage_db_baseline(data_dir, db_path);
+    let sole_copy_warnings = build_doctor_sole_copy_warnings(&baseline);
     let coverage_summary = build_doctor_coverage_summary(
         &source_inventory,
         &raw_mirror,
-        &backfill,
+        &baseline,
         &sole_copy_warnings,
     );
     doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
@@ -21654,6 +21779,29 @@ fn build_doctor_source_authority_report(
             vec![
                 "coverage-shrinks-relative-to-archive".to_string(),
                 "provider-pruning-risk".to_string(),
+            ],
+        ));
+    } else if source_inventory.local_source_count > 0 {
+        // With raw-mirror capture removed, the visible upstream source files are
+        // the candidate-seeding authority when archive coverage is fully
+        // accounted for (no pruned or unmapped local rows). This is
+        // candidate-only: it can stage an isolated rebuild candidate that the
+        // coverage gate still vets, but it never directly promotes over the
+        // canonical archive DB.
+        selected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::LiveUpstreamSource,
+            DoctorSourceAuthorityDecision::CandidateOnly,
+            format!(
+                "all {} indexed local conversation(s) still have visible upstream source files; live sources may seed an isolated rebuild candidate",
+                source_inventory.local_source_count
+            ),
+            coverage_delta.visible_local_source_minus_archive,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            vec![
+                "source-path-visible".to_string(),
+                "provider-identity-known".to_string(),
+                "coverage-continuity-proven".to_string(),
             ],
         ));
     }
@@ -39759,116 +39907,53 @@ mod doctor_asset_taxonomy_tests {
         let source_inventory =
             build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
 
-        let mirrored_bytes = b"{\"type\":\"message\",\"text\":\"mirrored\"}\n";
-        let mirrored_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &missing_source,
-            mirrored_bytes,
-            vec![DoctorRawMirrorDbLink {
-                conversation_id: Some(2),
-                message_count: Some(3),
-                source_path: Some(missing_source.display().to_string()),
-                started_at_ms: Some(1_700_000_000_000),
-            }],
-        );
-        write_raw_mirror_test_manifest(&data_dir, &mirrored_manifest, mirrored_bytes);
-        let unlinked_bytes = b"{\"type\":\"message\",\"text\":\"orphan mirror\"}\n";
-        let unlinked_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &sessions_dir.join("orphan.jsonl"),
-            unlinked_bytes,
-            Vec::new(),
-        );
-        write_raw_mirror_test_manifest(&data_dir, &unlinked_manifest, unlinked_bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
-
-        let backfill = DoctorRawMirrorBackfillReport {
-            schema_version: 1,
+        // Raw-mirror capture has been removed, so the coverage baseline now
+        // comes straight from the DB (conversations/messages) instead of
+        // raw-mirror backfill receipts. Construct the same archive shape: one
+        // visible local source, one pruned local source (sole-copy), one
+        // unmapped row, and one remote row.
+        let baseline = DoctorCoverageDbBaseline {
             db_available: true,
-            total_candidate_count: 3,
-            source_missing_count: 1,
-            db_projection_only_count: 1,
-            receipts: vec![
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "live-row".to_string(),
-                    conversation_id: Some(1),
-                    provider: "codex".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 2,
-                    started_at_ms: Some(1_700_000_000_000),
-                    redacted_source_path: Some("[cass-data]/sessions/live.jsonl".to_string()),
-                    source_path_blake3: Some(doctor_raw_mirror_backfill_source_path_blake3(
-                        &live_source.display().to_string(),
-                    )),
-                    source_stat_snapshot: Some(DoctorRawMirrorBackfillSourceStatSnapshot {
-                        exists: true,
-                        file_type: "file".to_string(),
-                        size_bytes: Some(10),
-                        modified_at_ms: Some(1_700_000_000_001),
-                        content_blake3: Some("live-hash".to_string()),
-                        stat_error: None,
-                    }),
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "missing-mirrored-row".to_string(),
-                    conversation_id: Some(2),
-                    provider: "codex".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 3,
-                    started_at_ms: Some(1_700_000_000_000),
-                    redacted_source_path: Some("[cass-data]/sessions/pruned.jsonl".to_string()),
-                    source_path_blake3: Some(doctor_raw_mirror_backfill_source_path_blake3(
-                        &missing_source.display().to_string(),
-                    )),
-                    raw_source_captured: true,
-                    raw_mirror_db_linked: true,
-                    source_missing: true,
-                    parse_loss_unknown: false,
-                    raw_mirror_manifest_id: Some(mirrored_manifest.manifest_id.clone()),
-                    raw_mirror_blob_blake3: Some(mirrored_manifest.blob_blake3.clone()),
-                    raw_mirror_blob_size_bytes: Some(mirrored_bytes.len() as u64),
-                    source_stat_snapshot: Some(DoctorRawMirrorBackfillSourceStatSnapshot {
-                        exists: false,
-                        file_type: "missing".to_string(),
-                        stat_error: Some("not found".to_string()),
-                        ..DoctorRawMirrorBackfillSourceStatSnapshot::default()
-                    }),
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "unknown-row".to_string(),
-                    conversation_id: Some(3),
-                    provider: "unknown".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 5,
-                    db_projection_only: true,
-                    parse_loss_unknown: true,
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-            ],
-            ..DoctorRawMirrorBackfillReport::default()
+            archive_conversation_count: 4,
+            archived_message_count: 10,
+            visible_current_source_count: 1,
+            visible_current_source_bytes: 10,
+            current_source_newer_than_archive_count: 1,
+            // The pruned local row is the only DB row without an upstream copy.
+            db_without_raw_mirror_count: 1,
+            // Pruned local + unmapped + remote rows are DB-projection-only.
+            db_projection_only_count: 3,
+            missing_current_source_count: 1,
+            earliest_started_at_ms: Some(1_700_000_000_000),
+            latest_started_at_ms: Some(1_700_000_000_000),
+            missing_sources: vec![DoctorMissingSourceDetail {
+                conversation_id: Some(2),
+                provider: "codex".to_string(),
+                source_id: "local".to_string(),
+                origin_kind: "local".to_string(),
+                origin_host: None,
+                redacted_source_path: Some("[cass-data]/sessions/pruned.jsonl".to_string()),
+                source_path_blake3: Some(doctor_raw_mirror_backfill_source_path_blake3(
+                    &missing_source.display().to_string(),
+                )),
+                message_count: 3,
+                db_projection_only: true,
+            }],
         };
 
-        let sole_copy_warnings = build_doctor_sole_copy_warnings(&backfill);
+        let sole_copy_warnings = build_doctor_sole_copy_warnings(&baseline);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
         let summary = build_doctor_coverage_summary(
             &source_inventory,
             &raw_mirror,
-            &backfill,
+            &baseline,
             &sole_copy_warnings,
         );
 
         assert_eq!(sole_copy_warnings.len(), 1);
-        assert_eq!(sole_copy_warnings[0].confidence_tier, "verified_raw_mirror");
-        assert!(sole_copy_warnings[0].raw_source_captured);
-        assert!(!sole_copy_warnings[0].db_projection_only);
+        assert_eq!(sole_copy_warnings[0].confidence_tier, "db_projection_only");
+        assert!(!sole_copy_warnings[0].raw_source_captured);
+        assert!(sole_copy_warnings[0].db_projection_only);
         let rendered_warning =
             serde_json::to_string(&sole_copy_warnings[0]).expect("sole-copy warning json");
         assert!(
@@ -39881,11 +39966,11 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(summary.provider_count, 3);
         assert_eq!(summary.visible_current_source_count, 1);
         assert_eq!(summary.visible_current_source_bytes, 10);
-        assert_eq!(summary.raw_mirror_manifest_count, 2);
-        assert_eq!(summary.raw_mirror_db_link_count, 1);
-        assert_eq!(summary.db_without_raw_mirror_count, 2);
-        assert_eq!(summary.db_projection_only_count, 1);
-        assert_eq!(summary.mirror_without_db_link_count, 1);
+        assert_eq!(summary.raw_mirror_manifest_count, 0);
+        assert_eq!(summary.raw_mirror_db_link_count, 0);
+        assert_eq!(summary.db_without_raw_mirror_count, 1);
+        assert_eq!(summary.db_projection_only_count, 3);
+        assert_eq!(summary.mirror_without_db_link_count, 0);
         assert_eq!(summary.missing_current_source_count, 1);
         assert_eq!(summary.sole_copy_candidate_count, 1);
         assert_eq!(summary.current_source_newer_than_archive_count, 1);
@@ -39898,38 +39983,23 @@ mod doctor_asset_taxonomy_tests {
         let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len());
         assert_eq!(risk.status, "sole_copy_risk");
         assert_eq!(risk.sole_copy_warning_count, 1);
-        assert_eq!(risk.raw_mirror_db_link_count, 1);
-        assert_eq!(risk.db_without_raw_mirror_count, 2);
-        assert_eq!(risk.mirror_without_db_link_count, 1);
+        assert_eq!(risk.raw_mirror_db_link_count, 0);
+        assert_eq!(risk.db_without_raw_mirror_count, 1);
+        assert_eq!(risk.mirror_without_db_link_count, 0);
         assert_eq!(risk.current_source_newer_than_archive_count, 1);
 
-        assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 1, 1, 0, 0),
-            "sole_copy_verified_raw_mirror"
-        );
         assert_eq!(
             doctor_coverage_confidence_tier(1, 1, 1, 1, 0, 0, 0),
             "sole_copy_db_projection"
         );
         assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 0, 1, 0, 1),
+            doctor_coverage_confidence_tier(1, 0, 0, 0, 0, 0, 1),
             "current_source_newer_than_archive"
         );
         assert_eq!(
-            doctor_coverage_confidence_tier(0, 0, 0, 0, 0, 1, 0),
-            "raw_mirror_unlinked"
+            doctor_coverage_confidence_tier(1, 0, 1, 0, 0, 0, 0),
+            "archive_db_without_raw_mirror"
         );
-        let mirror_only_risk = doctor_coverage_risk_summary(
-            &DoctorCoverageSummary {
-                confidence_tier: "raw_mirror_unlinked".to_string(),
-                mirror_without_db_link_count: 1,
-                recommended_action: "inspect mirror".to_string(),
-                ..DoctorCoverageSummary::default()
-            },
-            0,
-        );
-        assert_eq!(mirror_only_risk.status, "raw_mirror_unlinked");
-        assert_eq!(mirror_only_risk.mirror_without_db_link_count, 1);
     }
 
     fn doctor_test_source_authority_report() -> DoctorSourceAuthorityReport {
@@ -45733,11 +45803,12 @@ pub(crate) fn run_doctor_impl(
         fix_available: backfill_fix_available,
         fix_applied: backfill_fix_applied,
     });
-    let sole_copy_warnings = build_doctor_sole_copy_warnings(&raw_mirror_backfill);
+    let coverage_baseline = collect_doctor_coverage_db_baseline(&data_dir, &db_path);
+    let sole_copy_warnings = build_doctor_sole_copy_warnings(&coverage_baseline);
     let coverage_summary = build_doctor_coverage_summary(
         &source_inventory,
         &raw_mirror,
-        &raw_mirror_backfill,
+        &coverage_baseline,
         &sole_copy_warnings,
     );
     let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
@@ -53999,20 +54070,17 @@ fn run_index_with_data(
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
-    // Hotfix: also sweep at pass START so reclaim never depends on a single pass
-    // reaching its end-of-pass sweep — a crashed pass's leftovers are reclaimed on
-    // the next pass's start. Runs on the prior pass's at-rest state, before any
-    // capture this pass; best-effort and lock-guarded internally (skips if a run
-    // is active). Keep newest N per source (CASS_RAW_MIRROR_RETENTION, 0 disables).
+    // The raw-mirror write path has been removed. At pass START we
+    // unconditionally PURGE any leftover raw-mirror store so existing oversized
+    // mirrors (which the deprecated write path could grow without bound) are
+    // reclaimed on the next pass. Best-effort and lock-guarded internally (skips
+    // if a run is active); a purge error must never fail the index pass.
     {
-        let keep = raw_mirror_retention_default();
-        if let Err(gc_err) =
-            crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, false)
-        {
+        if let Err(purge_err) = crate::raw_mirror::purge_raw_mirror_root(&data_dir, false) {
             tracing::warn!(
-                error = %gc_err,
+                error = %purge_err,
                 data_dir = %data_dir.display(),
-                "start-of-pass raw-mirror sweep failed; continuing"
+                "start-of-pass raw-mirror purge failed; continuing"
             );
         }
     }
@@ -54697,30 +54765,25 @@ fn run_index_with_data(
         eprintln!("index completed");
     }
 
-    // Hotfix: once-per-pass raw-mirror retention sweep so superseded snapshots
-    // do not accumulate unboundedly (whole-file blobs are re-captured on every
-    // append and never reclaimed otherwise). Keep newest N per source
-    // (CASS_RAW_MIRROR_RETENTION, default 1; 0 disables). Best-effort: a sweep
-    // failure must not fail an otherwise-successful index pass.
+    // The raw-mirror write path has been removed. Once per pass we unconditionally
+    // PURGE the leftover raw-mirror store so oversized mirrors are reclaimed.
+    // Best-effort: a purge failure must not fail an otherwise-successful index pass.
     if res.is_ok() {
-        let keep = raw_mirror_retention_default();
-        match crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, false) {
-            Ok(stats) if stats.manifests_pruned > 0 || stats.blobs_deleted > 0 => {
+        match crate::raw_mirror::purge_raw_mirror_root(&data_dir, false) {
+            Ok(stats) if stats.removed => {
                 tracing::info!(
-                    manifests_pruned = stats.manifests_pruned,
-                    blobs_deleted = stats.blobs_deleted,
                     bytes_reclaimed = stats.bytes_reclaimed,
-                    keep,
+                    entries_removed = stats.entries_removed,
                     data_dir = %data_dir.display(),
-                    "raw-mirror retention sweep reclaimed superseded snapshots"
+                    "raw-mirror purge reclaimed deprecated store"
                 );
             }
             Ok(_) => {}
-            Err(gc_err) => {
+            Err(purge_err) => {
                 tracing::warn!(
-                    error = %gc_err,
+                    error = %purge_err,
                     data_dir = %data_dir.display(),
-                    "raw-mirror retention sweep failed; disk may not be reclaimed until next pass"
+                    "raw-mirror purge failed; disk may not be reclaimed until next pass"
                 );
             }
         }
@@ -61169,61 +61232,27 @@ fn run_timeline(
     Ok(())
 }
 
-/// Handle sources subcommands (P5.x)
-/// Default retention (newest captures kept per source) when `--keep` is absent.
-/// Env-overridable, mirroring `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION`.
-fn raw_mirror_retention_default() -> usize {
-    dotenvy::var("CASS_RAW_MIRROR_RETENTION")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
-}
-
 fn run_raw_mirror_command(cmd: RawMirrorCommand, _cli: &Cli) -> CliResult<()> {
     match cmd {
-        RawMirrorCommand::Gc {
-            data_dir,
-            keep,
-            apply,
-        } => {
-            let keep = keep.unwrap_or_else(raw_mirror_retention_default);
-            let stats = crate::raw_mirror::sweep_raw_mirror_retention(&data_dir, keep, !apply)
-                .map_err(|err| CliError::unknown(format!("raw-mirror gc failed: {err:#}")))?;
-            if stats.skipped_active_index {
-                println!(
-                    "raw-mirror gc skipped: an index run is active. Wait for indexing to finish, then retry."
-                );
-                return Ok(());
-            }
+        RawMirrorCommand::Purge { data_dir, apply } => {
+            let data_dir = data_dir.unwrap_or_else(default_data_dir);
+            let stats = crate::raw_mirror::purge_raw_mirror_root(&data_dir, !apply)
+                .map_err(|err| CliError::unknown(format!("raw-mirror purge failed: {err:#}")))?;
             let mode = if stats.dry_run {
-                "DRY-RUN (no files deleted; pass --apply to delete)"
-            } else {
+                "DRY-RUN (nothing deleted; pass --apply to purge)"
+            } else if stats.removed {
                 "APPLIED"
+            } else {
+                "APPLIED (nothing to purge or an index run is active; retry later)"
             };
             let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            let total_reclaimed = stats
-                .bytes_reclaimed
-                .saturating_add(stats.tmp_bytes_reclaimed);
-            println!("raw-mirror gc [{mode}] keep={keep}");
-            println!("  manifests scanned : {}", stats.manifests_scanned);
-            println!("  source files      : {}", stats.source_files);
-            println!("  manifests pruned  : {}", stats.manifests_pruned);
-            println!("  blobs deleted     : {}", stats.blobs_deleted);
+            println!("raw-mirror purge [{mode}]");
+            println!("  store removed     : {}", stats.removed);
+            println!("  entries reclaimed : {}", stats.entries_removed);
             println!(
-                "  blob bytes        : {} ({:.2} GiB)",
+                "  bytes reclaimed   : {} ({:.2} GiB)",
                 stats.bytes_reclaimed,
                 gib(stats.bytes_reclaimed)
-            );
-            println!("  tmp orphans swept : {}", stats.tmp_orphans_swept);
-            println!(
-                "  tmp bytes         : {} ({:.2} GiB)",
-                stats.tmp_bytes_reclaimed,
-                gib(stats.tmp_bytes_reclaimed)
-            );
-            println!(
-                "  total reclaimed   : {} ({:.2} GiB)",
-                total_reclaimed,
-                gib(total_reclaimed)
             );
             Ok(())
         }
