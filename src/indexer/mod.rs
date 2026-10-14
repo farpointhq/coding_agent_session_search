@@ -5,6 +5,7 @@ pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
+pub(crate) mod staging_reclaim;
 
 use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
@@ -9433,6 +9434,12 @@ pub fn run_index(
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
     );
+    // GH#324 (backported from upstream 4fddb21f2): reclaim staging debris
+    // stranded by previous hard-killed runs now that we hold the exclusive
+    // index-run lock. Fabric SIGTERMs passes on timeout / memory cap, which
+    // skips TempDir Drop and strands cass-lexical-{shards,merge}.* dirs.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(&opts.data_dir, SystemTime::now())
+        .log();
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -11495,6 +11502,9 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
     );
+    // GH#324: this repair path also stages under the index root; sweep
+    // debris from previous crashed runs while we hold the exclusive lock.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
