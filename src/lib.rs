@@ -1468,6 +1468,12 @@ pub enum AgentsAction {
         /// Agent slug to re-enable
         agent: String,
     },
+    /// Delete an agent's already indexed archive data without changing the
+    /// exclusion list (for apps that pick connectors with CASS_ONLY_AGENTS)
+    Purge {
+        /// Agent slug whose indexed data to delete
+        agent: String,
+    },
 }
 
 /// Time bucketing for analytics aggregation.
@@ -64367,7 +64373,28 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
             keep_indexed_data,
         } => run_agents_exclude(&agent, keep_indexed_data, cli),
         AgentsAction::Include { agent } => run_agents_include(&agent),
+        AgentsAction::Purge { agent } => run_agents_purge(&agent, cli),
     }
+}
+
+fn run_agents_purge(agent: &str, cli: &Cli) -> CliResult<()> {
+    if crate::sources::config::normalize_agent_config_name(agent).is_none() {
+        return Err(CliError {
+            code: 11,
+            kind: CliErrorKind::Config.kind_str(),
+            message: "agent name cannot be empty".into(),
+            hint: Some("Provide a non-empty agent slug such as 'codex'".into()),
+            retryable: false,
+        });
+    }
+    let purge = purge_excluded_agent_archive_data(agent, cli)?;
+    println!(
+        "Purged {} conversations and {} messages archived for '{}'.",
+        purge.conversations_deleted,
+        purge.messages_deleted,
+        archive_agent_slug_for_exclusion(agent)
+    );
+    Ok(())
 }
 
 fn archive_agent_slug_for_exclusion(agent: &str) -> String {

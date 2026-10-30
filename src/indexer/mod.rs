@@ -8988,7 +8988,38 @@ fn run_streaming_index(
 type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
 fn configured_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
-    filter_disabled_connector_factories(get_connector_factories())
+    filter_only_agents_connector_factories(filter_disabled_connector_factories(
+        get_connector_factories(),
+    ))
+}
+
+/// Fabric: `CASS_ONLY_AGENTS` (comma-separated connector slugs) limits indexing
+/// to those connectors, so an app can index only the assistants its user picked
+/// and leave newly installed ones out. Set but empty keeps none; unset keeps
+/// all. Applied after the `disabled_agents` filter.
+fn filter_only_agents_connector_factories(
+    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+) -> Vec<(&'static str, ConnectorFactory)> {
+    let Ok(raw) = dotenvy::var("CASS_ONLY_AGENTS") else {
+        return connector_factories;
+    };
+    let only = raw
+        .split(',')
+        .filter_map(crate::sources::config::normalize_agent_config_name)
+        .collect::<std::collections::HashSet<_>>();
+    let filtered = connector_factories
+        .into_iter()
+        .filter(|(name, _)| {
+            crate::sources::config::normalize_agent_config_name(name)
+                .is_some_and(|name| only.contains(&name))
+        })
+        .collect::<Vec<_>>();
+    tracing::info!(
+        only_agents = ?only,
+        enabled_connectors = filtered.len(),
+        "indexing only the connectors named in CASS_ONLY_AGENTS"
+    );
+    filtered
 }
 
 fn filter_disabled_connector_factories(
@@ -34784,6 +34815,46 @@ mod tests {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["codex"]);
+    }
+
+    fn connector_names(factories: Vec<(&'static str, ConnectorFactory)>) -> Vec<&'static str> {
+        factories.into_iter().map(|(name, _)| name).collect()
+    }
+
+    fn three_connectors() -> Vec<(&'static str, ConnectorFactory)> {
+        vec![
+            ("claude", never_constructed_connector_factory),
+            ("codex", never_constructed_connector_factory),
+            ("cursor", never_constructed_connector_factory),
+        ]
+    }
+
+    #[test]
+    #[serial]
+    fn only_agents_keeps_just_the_named_connectors() {
+        // `claude_code` is the public slug; the factory is named `claude`.
+        let _guard = set_env_var("CASS_ONLY_AGENTS", " claude_code, Cursor ");
+        assert_eq!(
+            connector_names(filter_only_agents_connector_factories(three_connectors())),
+            vec!["claude", "cursor"]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn only_agents_set_but_empty_keeps_none() {
+        let _guard = set_env_var("CASS_ONLY_AGENTS", "");
+        assert!(filter_only_agents_connector_factories(three_connectors()).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn only_agents_unset_keeps_all() {
+        let _guard = unset_env_var("CASS_ONLY_AGENTS");
+        assert_eq!(
+            connector_names(filter_only_agents_connector_factories(three_connectors())),
+            vec!["claude", "codex", "cursor"]
+        );
     }
 
     #[test]

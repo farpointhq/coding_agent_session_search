@@ -60,7 +60,7 @@ pub(crate) fn agent_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-fn normalize_agent_config_name(name: &str) -> Option<String> {
+pub(crate) fn normalize_agent_config_name(name: &str) -> Option<String> {
     let normalized = match agent_name_key(name).as_str() {
         "claude_code" => "claude".to_string(),
         "open_claw" => "openclaw".to_string(),
