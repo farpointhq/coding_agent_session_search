@@ -334,6 +334,13 @@ pub enum Commands {
         /// Also honored via CASS_INDEX_NO_PROGRESS_EVENTS=1 env var.
         #[arg(long, default_value_t = false)]
         no_progress_events: bool,
+
+        /// Index only these agents (repeatable); all agents when absent
+        #[arg(long = "only-agent", value_name = "AGENT")]
+        only_agents: Vec<String>,
+        /// Scan these agents from the start this run, ignoring the incremental cut-off (repeatable)
+        #[arg(long = "rescan-agent", value_name = "AGENT")]
+        rescan_agents: Vec<String>,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -1466,6 +1473,12 @@ pub enum AgentsAction {
     /// Re-include an agent/connector in future indexing runs
     Include {
         /// Agent slug to re-enable
+        agent: String,
+    },
+    /// Delete an agent's already indexed archive data without changing the
+    /// exclusion list (for apps that pick connectors with `cass index --only-agent`)
+    Purge {
+        /// Agent slug whose indexed data to delete
         agent: String,
     },
 }
@@ -3327,6 +3340,8 @@ async fn execute_cli(
                     json,
                     progress_interval_ms,
                     no_progress_events,
+                    only_agents,
+                    rescan_agents,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
@@ -3340,6 +3355,8 @@ async fn execute_cli(
                         semantic,
                         build_hnsw,
                         embedder,
+                        (!only_agents.is_empty()).then_some(only_agents),
+                        rescan_agents,
                         progress,
                         structured_format,
                         idempotency_key,
@@ -46603,6 +46620,8 @@ pub(crate) fn run_doctor_impl(
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
+                    only_agents: None,
+                    rescan_agents: Vec::new(),
                 };
 
                 let rebuild_handle = std::thread::spawn(move || {
@@ -53764,6 +53783,8 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         embedder: "fastembed".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
+        only_agents: None,
+        rescan_agents: Vec::new(),
     };
     eprintln!("Refreshing index...");
 
@@ -54058,6 +54079,11 @@ fn run_index_with_data(
     semantic: bool,
     build_hnsw: bool,
     embedder: String,
+    // Index only these agents (already mapped from the CLI `Vec<String>` to
+    // `None` when absent).
+    only_agents: Option<Vec<String>>,
+    // Scan these agents from the start this run, ignoring the incremental cut-off.
+    rescan_agents: Vec<String>,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
@@ -54274,6 +54300,8 @@ fn run_index_with_data(
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
+        only_agents,
+        rescan_agents,
     };
 
     // Set up progress display
@@ -62801,6 +62829,8 @@ fn run_sources_sync(
             false,          // semantic
             false,          // build_hnsw
             "fastembed".to_string(),
+            None,       // only_agents (all agents)
+            Vec::new(), // rescan_agents
             progress,
             output_format,
             None,  // idempotency_key
@@ -64367,7 +64397,28 @@ fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
             keep_indexed_data,
         } => run_agents_exclude(&agent, keep_indexed_data, cli),
         AgentsAction::Include { agent } => run_agents_include(&agent),
+        AgentsAction::Purge { agent } => run_agents_purge(&agent, cli),
     }
+}
+
+fn run_agents_purge(agent: &str, cli: &Cli) -> CliResult<()> {
+    if crate::sources::config::normalize_agent_config_name(agent).is_none() {
+        return Err(CliError {
+            code: 11,
+            kind: CliErrorKind::Config.kind_str(),
+            message: "agent name cannot be empty".into(),
+            hint: Some("Provide a non-empty agent slug such as 'codex'".into()),
+            retryable: false,
+        });
+    }
+    let purge = purge_excluded_agent_archive_data(agent, cli)?;
+    println!(
+        "Purged {} conversations and {} messages archived for '{}'.",
+        purge.conversations_deleted,
+        purge.messages_deleted,
+        archive_agent_slug_for_exclusion(agent)
+    );
+    Ok(())
 }
 
 fn archive_agent_slug_for_exclusion(agent: &str) -> String {

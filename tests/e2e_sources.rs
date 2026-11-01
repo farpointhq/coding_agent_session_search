@@ -309,6 +309,53 @@ fn sources_agents_include_removes_existing_exclusion() {
 }
 
 #[test]
+fn sources_agents_purge_deletes_one_agent_and_leaves_the_config_alone() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_root = tmp.path().join("data");
+    let data_dir = cass_data_dir(&data_root);
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+
+    seed_archive_conversation(&db_path, "openclaw", "purge-me");
+    seed_archive_conversation(&db_path, "codex", "keep-me");
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "purge", "openclaw"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("sources agents purge command");
+    assert!(
+        output.status.success(),
+        "purge failed: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let conversations = storage.list_conversations(10, 0).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].agent_slug, "codex");
+    // Nothing persisted: the app names its connectors per run instead.
+    assert!(!config_dir.join("cass").join("sources.toml").exists());
+}
+
+#[test]
+fn sources_agents_purge_rejects_an_empty_agent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "purge", "  "])
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .env("CASS_DATA_DIR", tmp.path())
+        .output()
+        .expect("sources agents purge command");
+    assert!(!output.status.success());
+}
+
+#[test]
 fn sources_agents_exclude_purges_local_archive_data_by_default() {
     let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");
     let _trace_guard = tracker.trace_env_guard();

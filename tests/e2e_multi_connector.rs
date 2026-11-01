@@ -7,6 +7,8 @@
 //! - Results are properly attributed to their source connector
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 
@@ -1645,4 +1647,245 @@ fn multi_connector_empty_connector() {
     );
 
     tracker.complete();
+}
+
+// ============================================================================
+// `--only-agent` / `--rescan-agent` flag tests (Fabric connector include list)
+// ============================================================================
+
+/// Shared body for the `--only-agent` / `--rescan-agent` E2E tests. Index only
+/// codex, then turn claude_code on without a rescan (its pre-existing session
+/// must stay unindexed behind the incremental cut-off — this pins the problem
+/// the rescan flag exists for), then bring that session in via
+/// `--rescan-agent` and confirm both the canonical database and the search
+/// index know about it while codex is not duplicated.
+///
+/// Runs once through the streaming path (default) and once through the batch
+/// path (`CASS_STREAMING_INDEX=0`).
+fn only_agent_rescan_flow(test_name: &str, batch_streaming_env: Option<&str>) {
+    let tracker = tracker_for(test_name);
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let claude_home = home.join(".claude");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    // Phase: Create BOTH sessions FIRST. Their file contents are dated 2024
+    // and their file mtimes predate the first index run, so the incremental
+    // cut-off saved by step 1 must keep claude's older chat unindexed in step 2.
+    let phase_start = tracker.start(
+        "setup_fixtures",
+        Some("Create Codex and Claude sessions before the first index run"),
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-onlyagent.jsonl",
+        "onlyagent codex_clockwork",
+        1732118400000,
+    );
+    make_claude_session(
+        &claude_home,
+        "onlyagent-project",
+        "session-onlyagent.jsonl",
+        "onlyagent claude_zephyr",
+        "2024-11-20T10:00:00Z",
+    );
+    tracker.end(
+        "setup_fixtures",
+        Some("Create Codex and Claude sessions before the first index run"),
+        phase_start,
+    );
+
+    // The incremental cut-off for step 2 is captured inside step 1's run. Give
+    // the fixture mtimes a firm lead over that moment so coarse (1-2 s)
+    // filesystem mtime granularity can never make a fixture look newer than
+    // the cut-off by truncation.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let run_index = |args: &[&str]| -> std::process::Output {
+        let mut cmd = cargo_bin_cmd!("cass");
+        cmd.arg("index");
+        cmd.args(args);
+        cmd.arg("--data-dir").arg(&data_dir);
+        if let Some(batch) = batch_streaming_env {
+            cmd.env(batch, "0");
+        }
+        cmd.env("CODEX_HOME", &codex_home).env("HOME", home);
+        cmd.output().expect("failed to spawn cass index")
+    };
+
+    let search_hits = |term: &str| -> Vec<serde_json::Value> {
+        let output = cargo_bin_cmd!("cass")
+            .args(["search", term, "--robot", "--data-dir"])
+            .arg(&data_dir)
+            .env("HOME", home)
+            .output()
+            .expect("failed to spawn cass search");
+        assert!(
+            output.status.success(),
+            "cass search {term} should succeed: {}",
+            truncate_output(&output.stderr, 1000)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+        json.get("hits")
+            .and_then(|h| h.as_array())
+            .expect("hits array")
+            .to_vec()
+    };
+
+    let count_conversations = |source_path_suffix: &str| -> i64 {
+        let storage = SqliteStorage::open(&data_dir.join("agent_search.db"))
+            .expect("open canonical database");
+        let sql = format!(
+            "SELECT COUNT(*) FROM conversations \
+             WHERE source_path LIKE '%{source_path_suffix}'"
+        );
+        storage
+            .raw()
+            .query_row_map(&sql, &[], |row| row.get_typed::<i64>(0))
+            .expect("count conversations by source_path suffix")
+    };
+
+    // Step 1: index only codex -> codex indexed, claude not.
+    let phase_start = tracker.start(
+        "only_agent_codex",
+        Some("Step 1: index --only-agent codex indexes only codex"),
+    );
+    let step1 = run_index(&["--only-agent", "codex"]);
+    assert!(
+        step1.status.success(),
+        "step 1 index should succeed: {}",
+        truncate_output(&step1.stderr, 1000)
+    );
+    tracker.end(
+        "only_agent_codex",
+        Some("Step 1: index --only-agent codex indexes only codex"),
+        phase_start,
+    );
+
+    let codex_hits_1 = search_hits("codex_clockwork");
+    assert!(
+        !codex_hits_1.is_empty() && codex_hits_1.iter().all(|h| h["agent"] == "codex"),
+        "step 1 should index codex only; hits: {codex_hits_1:?}"
+    );
+    let claude_hits_1 = search_hits("claude_zephyr");
+    assert!(
+        claude_hits_1.is_empty(),
+        "step 1 must not index claude_code (--only-agent codex); hits: {claude_hits_1:?}"
+    );
+    let claude_db_1 = count_conversations("session-onlyagent.jsonl");
+    assert_eq!(
+        claude_db_1, 0,
+        "claude conversation must not be in the database after step 1"
+    );
+    let codex_db_1 = count_conversations("rollout-onlyagent.jsonl");
+    assert!(
+        codex_db_1 >= 1,
+        "codex conversation must be in the database after step 1"
+    );
+
+    // Step 2: claude_code is switched on without a rescan -> its older session
+    // stays unindexed behind the incremental cut-off. If this ever starts
+    // passing, the --rescan-agent flag may no longer be needed.
+    let phase_start = tracker.start(
+        "claude_without_rescan",
+        Some("Step 2: adding claude_code without --rescan-agent does not index its older session"),
+    );
+    let step2 = run_index(&["--only-agent", "codex", "--only-agent", "claude_code"]);
+    assert!(
+        step2.status.success(),
+        "step 2 index should succeed: {}",
+        truncate_output(&step2.stderr, 1000)
+    );
+    tracker.end(
+        "claude_without_rescan",
+        Some("Step 2: adding claude_code without --rescan-agent does not index its older session"),
+        phase_start,
+    );
+
+    let claude_hits_2 = search_hits("claude_zephyr");
+    assert!(
+        claude_hits_2.is_empty(),
+        "step 2 must keep claude_code's older session unindexed \
+         (incremental cut-off exists to be overridden via --rescan-agent); hits: {claude_hits_2:?}"
+    );
+    assert_eq!(
+        count_conversations("session-onlyagent.jsonl"),
+        0,
+        "claude conversation must still be absent from the database after step 2"
+    );
+
+    // Step 3: the rescan pulls claude_code's older session in.
+    let phase_start = tracker.start(
+        "claude_with_rescan",
+        Some("Step 3: --rescan-agent claude_code indexes the older session"),
+    );
+    let step3 = run_index(&[
+        "--only-agent",
+        "codex",
+        "--only-agent",
+        "claude_code",
+        "--rescan-agent",
+        "claude_code",
+    ]);
+    assert!(
+        step3.status.success(),
+        "step 3 index should succeed: {}",
+        truncate_output(&step3.stderr, 1000)
+    );
+    tracker.end(
+        "claude_with_rescan",
+        Some("Step 3: --rescan-agent claude_code indexes the older session"),
+        phase_start,
+    );
+
+    let claude_hits_3 = search_hits("claude_zephyr");
+    assert!(
+        !claude_hits_3.is_empty(),
+        "step 3 with --rescan-agent claude_code must make the older claude session searchable"
+    );
+    assert!(
+        claude_hits_3.iter().all(|h| h["agent"] == "claude_code"),
+        "rescanned hits should be attributed to claude_code; hits: {claude_hits_3:?}"
+    );
+    assert!(
+        count_conversations("session-onlyagent.jsonl") >= 1,
+        "claude conversation must be in the database after step 3"
+    );
+
+    // Codex is not duplicated by the later runs.
+    let codex_hits_3 = search_hits("codex_clockwork");
+    assert_eq!(
+        codex_hits_3.len(),
+        codex_hits_1.len(),
+        "step 3 must not duplicate codex hits; before: {codex_hits_1:?}, after: {codex_hits_3:?}"
+    );
+    assert_eq!(
+        count_conversations("rollout-onlyagent.jsonl"),
+        codex_db_1,
+        "step 3 must not duplicate codex conversations in the database"
+    );
+
+    tracker.complete();
+}
+
+/// The flag flow over the default streaming scan path.
+#[test]
+fn only_agent_and_rescan_agent_flags_streaming_path() {
+    only_agent_rescan_flow("only_agent_and_rescan_agent_flags_streaming_path", None);
+}
+
+/// The flag flow over the batch scan path (`CASS_STREAMING_INDEX=0`).
+#[test]
+fn only_agent_and_rescan_agent_flags_batch_path() {
+    only_agent_rescan_flow(
+        "only_agent_and_rescan_agent_flags_batch_path",
+        Some("CASS_STREAMING_INDEX"),
+    );
 }

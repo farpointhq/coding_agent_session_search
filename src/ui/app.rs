@@ -18621,6 +18621,8 @@ impl super::ftui_adapter::Model for CassApp {
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,
+                            only_agents: None,
+                            rescan_agents: Vec::new(),
                         };
                         match crate::indexer::run_index(opts, None) {
                             Ok(()) => CassMsg::IndexRefreshCompleted,

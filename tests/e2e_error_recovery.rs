@@ -290,6 +290,8 @@ fn test_corrupted_index_triggers_rebuild() {
         semantic: false,
         build_hnsw: false,
         embedder: "fastembed".to_string(),
+        only_agents: None,
+        rescan_agents: Vec::new(),
         progress: None,
         watch_interval_secs: 30,
     };
@@ -320,6 +322,8 @@ fn test_corrupted_index_triggers_rebuild() {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
