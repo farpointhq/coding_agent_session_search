@@ -104,6 +104,8 @@ fn bench_index_full(c: &mut Criterion) {
         semantic: false,
         build_hnsw: false,
         embedder: "fastembed".to_string(),
+        only_agents: None,
+        rescan_agents: Vec::new(),
         progress: None,
         watch_interval_secs: 30,
     };
@@ -170,6 +172,8 @@ fn bench_streaming_vs_batch(c: &mut Criterion) {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -237,6 +241,8 @@ fn bench_channel_overhead(c: &mut Criterion) {
         semantic: false,
         build_hnsw: false,
         embedder: "fastembed".to_string(),
+        only_agents: None,
+        rescan_agents: Vec::new(),
         progress: None,
         watch_interval_secs: 30,
     };
@@ -675,6 +681,8 @@ fn bench_ingest_with_responsiveness(c: &mut Criterion) {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -746,6 +754,8 @@ fn bench_card_defaults_ab(c: &mut Criterion) {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };

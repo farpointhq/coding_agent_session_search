@@ -213,6 +213,8 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
         semantic: false,
         build_hnsw: false,
         embedder: "fastembed".to_string(),
+        only_agents: None,
+        rescan_agents: Vec::new(),
         progress: None,
         watch_interval_secs: 30,
     };

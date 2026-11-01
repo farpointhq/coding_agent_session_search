@@ -76,6 +76,36 @@ fn index_parses_semantic_flags() -> Result<(), String> {
 }
 
 #[test]
+fn index_parses_only_agent_and_rescan_agent_flags() -> Result<(), String> {
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "index",
+            "--only-agent",
+            "codex",
+            "--only-agent",
+            "claude_code",
+            "--rescan-agent",
+            "claude_code",
+        ],
+        "parse only-agent/rescan-agent flags",
+    );
+
+    match cli.command {
+        Some(Commands::Index {
+            only_agents,
+            rescan_agents,
+            ..
+        }) => {
+            assert_eq!(only_agents, vec!["codex", "claude_code"]);
+            assert_eq!(rescan_agents, vec!["claude_code"]);
+            Ok(())
+        }
+        other => Err(format!("expected index command, got {other:?}")),
+    }
+}
+
+#[test]
 fn index_default_embedder_is_fastembed() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 

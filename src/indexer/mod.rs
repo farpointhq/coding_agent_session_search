@@ -827,6 +827,13 @@ pub struct IndexOptions {
     /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
     /// CPU burn when filesystem events arrive continuously. Default: 30.
     pub watch_interval_secs: u64,
+    /// Index only these connectors (by normalized agent name, e.g. `codex`,
+    /// `claude`). `None` uses every enabled connector, exactly as before.
+    pub only_agents: Option<Vec<String>>,
+    /// Connectors that this run rescans from the start: they get
+    /// `since_ts = None` instead of the incremental cut-off, so older sessions
+    /// of an assistant switched on later are finally indexed.
+    pub rescan_agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6536,7 +6543,7 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     }
 
     let additional_scan_roots = additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir);
-    let watch_roots = build_watch_roots(additional_scan_roots);
+    let watch_roots = build_watch_roots(additional_scan_roots, opts.only_agents.as_deref());
     if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
         return Ok(false);
     }
@@ -8980,32 +8987,38 @@ fn run_streaming_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
-        configured_connector_factories(),
+        configured_connector_factories(opts.only_agents.as_deref()),
         scan_start_ts,
     )
 }
 
 type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
-fn configured_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
-    filter_only_agents_connector_factories(filter_disabled_connector_factories(
-        get_connector_factories(),
-    ))
+fn configured_connector_factories(
+    only_agents: Option<&[String]>,
+) -> Vec<(&'static str, ConnectorFactory)> {
+    filter_only_agents_connector_factories(
+        filter_disabled_connector_factories(get_connector_factories()),
+        only_agents,
+    )
 }
 
-/// Fabric: `CASS_ONLY_AGENTS` (comma-separated connector slugs) limits indexing
-/// to those connectors, so an app can index only the assistants its user picked
-/// and leave newly installed ones out. Set but empty keeps none; unset keeps
-/// all. Applied after the `disabled_agents` filter.
+/// Limit indexing to a caller-provided list of connectors (`--only-agent`), so
+/// an app can index only the assistants its user picked and leave newly
+/// installed ones out. `None` keeps all connectors; the list is applied after
+/// the `disabled_agents` filter. Names are matched through
+/// `normalize_agent_config_name`, so the public slug `claude_code` matches a
+/// factory named `claude`; values that normalize to `None` are ignored.
 fn filter_only_agents_connector_factories(
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    only_agents: Option<&[String]>,
 ) -> Vec<(&'static str, ConnectorFactory)> {
-    let Ok(raw) = dotenvy::var("CASS_ONLY_AGENTS") else {
+    let Some(only_agents) = only_agents else {
         return connector_factories;
     };
-    let only = raw
-        .split(',')
-        .filter_map(crate::sources::config::normalize_agent_config_name)
+    let only = only_agents
+        .iter()
+        .filter_map(|agent| crate::sources::config::normalize_agent_config_name(agent))
         .collect::<std::collections::HashSet<_>>();
     let filtered = connector_factories
         .into_iter()
@@ -9017,9 +9030,39 @@ fn filter_only_agents_connector_factories(
     tracing::info!(
         only_agents = ?only,
         enabled_connectors = filtered.len(),
-        "indexing only the connectors named in CASS_ONLY_AGENTS"
+        "indexing only the connectors named by --only-agent"
     );
     filtered
+}
+
+/// Decide the effective `since_ts` for one connector in this run: a connector
+/// named in `--rescan-agent` scans from the start (`None`), every other
+/// connector keeps the normal incremental cut-off. Names are matched through
+/// `normalize_agent_config_name`, so the public slug `claude_code` matches the
+/// factory name `claude`; factory names that normalize to `None` keep the
+/// normal cut-off.
+fn connector_since_ts(
+    name: &str,
+    since_ts: Option<i64>,
+    rescan: &std::collections::HashSet<String>,
+) -> Option<i64> {
+    if crate::sources::config::normalize_agent_config_name(name)
+        .is_some_and(|name| rescan.contains(&name))
+    {
+        None
+    } else {
+        since_ts
+    }
+}
+
+/// Normalize raw `--rescan-agent` flag values into the connector-name set used
+/// by `connector_since_ts`. Values that normalize to `None` are ignored, so a
+/// rescan name that is not an enabled connector has no effect.
+fn normalized_rescan_agent_names(rescan_agents: &[String]) -> std::collections::HashSet<String> {
+    rescan_agents
+        .iter()
+        .filter_map(|agent| crate::sources::config::normalize_agent_config_name(agent))
+        .collect()
 }
 
 fn filter_disabled_connector_factories(
@@ -9122,12 +9165,16 @@ fn run_streaming_index_with_connector_factories(
     };
 
     // Spawn producer threads for each connector
+    let rescan_agents = normalized_rescan_agent_names(&opts.rescan_agents);
     let handles: Vec<(&'static str, JoinHandle<()>)> = connector_factories
         .into_iter()
         .map(|(name, factory)| {
+            let mut producer_config = producer_config.clone();
+            producer_config.since_ts =
+                connector_since_ts(name, producer_config.since_ts, &rescan_agents);
             (
                 name,
-                spawn_connector_producer(name, factory, tx.clone(), producer_config.clone()),
+                spawn_connector_producer(name, factory, tx.clone(), producer_config),
             )
         })
         .collect();
@@ -9219,7 +9266,7 @@ fn run_batch_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
-        configured_connector_factories(),
+        configured_connector_factories(opts.only_agents.as_deref()),
         scan_start_ts,
     )
 }
@@ -9257,6 +9304,7 @@ fn run_batch_index_with_connector_factories(
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
+    let rescan_agents = normalized_rescan_agent_names(&opts.rescan_agents);
 
     // Return type includes whether agent was discovered (for post-parallel name collection)
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
@@ -9266,6 +9314,7 @@ fn run_batch_index_with_connector_factories(
                 let conn = factory();
                 let detect = conn.detect();
                 let was_detected = detect.detected;
+                let conn_since_ts = connector_since_ts(name, since_ts, &rescan_agents);
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
 
@@ -9278,8 +9327,10 @@ fn run_batch_index_with_connector_factories(
                     }
                     is_discovered = true;
 
-                    let ctx =
-                        crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                    let ctx = crate::connectors::ScanContext::local_default(
+                        data_dir.clone(),
+                        conn_since_ts,
+                    );
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
@@ -9301,7 +9352,7 @@ fn run_batch_index_with_connector_factories(
                         let ctx = crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
-                            since_ts,
+                            conn_since_ts,
                         );
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
@@ -10599,7 +10650,8 @@ pub fn run_index(
     if opts.watch || opts.watch_once_paths.is_some() {
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
-        let watch_roots = build_watch_roots(additional_scan_roots.clone());
+        let watch_roots =
+            build_watch_roots(additional_scan_roots.clone(), opts.only_agents.as_deref());
         let watch_once_mode = opts
             .watch_once_paths
             .as_ref()
@@ -15344,8 +15396,11 @@ pub use crate::connectors::get_connector_factories;
 /// Includes:
 /// 1. Local roots detected by connectors
 /// 2. Remote mirror roots (assigned to ALL connectors since we don't know the mapping)
-fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
-    let factories = configured_connector_factories();
+fn build_watch_roots(
+    additional_scan_roots: Vec<ScanRoot>,
+    only_agents: Option<&[String]>,
+) -> Vec<(ConnectorKind, ScanRoot)> {
+    let factories = configured_connector_factories(only_agents);
     let mut roots = Vec::new();
     let mut all_kinds = Vec::new();
 
@@ -26477,6 +26532,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
         };
@@ -26532,6 +26589,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
         };
@@ -27311,6 +27370,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         }
@@ -31525,6 +31586,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
@@ -31613,6 +31676,8 @@ mod tests {
             semantic: true,
             build_hnsw: false,
             embedder: "hash".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
@@ -31734,6 +31799,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -31799,6 +31866,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -31896,6 +31965,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
         };
@@ -31970,6 +32041,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
         };
@@ -32046,6 +32119,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -32173,6 +32248,8 @@ mod tests {
             semantic: false,
             build_hnsw: false,
             embedder: "fastembed".to_string(),
+            only_agents: None,
+            rescan_agents: Vec::new(),
             progress: None,
             watch_interval_secs: 30,
         };
@@ -34830,31 +34907,40 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn only_agents_keeps_just_the_named_connectors() {
         // `claude_code` is the public slug; the factory is named `claude`.
-        let _guard = set_env_var("CASS_ONLY_AGENTS", " claude_code, Cursor ");
+        let only = vec![" claude_code".to_string(), "Cursor ".to_string()];
         assert_eq!(
-            connector_names(filter_only_agents_connector_factories(three_connectors())),
+            connector_names(filter_only_agents_connector_factories(
+                three_connectors(),
+                Some(only.as_slice())
+            )),
             vec!["claude", "cursor"]
         );
     }
 
     #[test]
-    #[serial]
-    fn only_agents_set_but_empty_keeps_none() {
-        let _guard = set_env_var("CASS_ONLY_AGENTS", "");
-        assert!(filter_only_agents_connector_factories(three_connectors()).is_empty());
+    fn only_agents_none_keeps_all() {
+        assert_eq!(
+            connector_names(filter_only_agents_connector_factories(
+                three_connectors(),
+                None
+            )),
+            vec!["claude", "codex", "cursor"]
+        );
     }
 
     #[test]
-    #[serial]
-    fn only_agents_unset_keeps_all() {
-        let _guard = unset_env_var("CASS_ONLY_AGENTS");
-        assert_eq!(
-            connector_names(filter_only_agents_connector_factories(three_connectors())),
-            vec!["claude", "codex", "cursor"]
-        );
+    fn connector_since_ts_rescan_connector_scans_from_the_start() {
+        let rescan = vec!["claude_code".to_string(), "bogus".to_string()];
+        let rescan = normalized_rescan_agent_names(&rescan);
+        // A rescan connector (matched by slug, `claude_code` -> factory `claude`)
+        // scans from the start; every other connector keeps the cut-off. A name
+        // that is not an enabled connector only has an effect if it matches a
+        // factory, so `bogus` is inert.
+        assert_eq!(connector_since_ts("claude", Some(42), &rescan), None);
+        assert_eq!(connector_since_ts("claude_code", Some(42), &rescan), None);
+        assert_eq!(connector_since_ts("codex", Some(42), &rescan), Some(42));
     }
 
     #[test]
